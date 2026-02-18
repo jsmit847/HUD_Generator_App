@@ -1,135 +1,116 @@
-import secrets
 import base64
 import hashlib
+import secrets
 import urllib.parse
+
 import requests
 import streamlit as st
-from simple_salesforce import Salesforce
 
-st.set_page_config(page_title="Salesforce Connection Test", layout="centered")
+st.title("Salesforce OAuth Test (Streamlit Cloud)")
 
-st.title("Salesforce Connection Test")
+# ---- Read secrets (must exist in Streamlit Cloud Secrets) ----
+sf_cfg = st.secrets.get("salesforce", None)
+if not sf_cfg:
+    st.error('Missing Streamlit secret section [salesforce]. Add it in "Manage app" -> "Settings" -> "Secrets".')
+    st.stop()
 
-# --- Secrets ---
-sf_cfg = st.secrets.get("salesforce", {})
-DOMAIN = sf_cfg.get("domain", "login")  # "login" (prod) or "test" (sandbox)
-CLIENT_ID = sf_cfg.get("client_id")
-CLIENT_SECRET = sf_cfg.get("client_secret")
-REDIRECT_URI = sf_cfg.get("redirect_uri")  # MUST be your Streamlit Cloud URL
+CLIENT_ID = sf_cfg.get("client_id", "").strip()
+CLIENT_SECRET = sf_cfg.get("client_secret", "").strip()
+DOMAIN = sf_cfg.get("domain", "login").strip()
+REDIRECT_URI = sf_cfg.get("redirect_uri", "").strip()
 
 if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
-    st.error(
-        'Missing Streamlit secrets. Add:\n\n'
-        '[salesforce]\n'
-        'domain = "login"\n'
-        'client_id = "..."\n'
-        'client_secret = "..."\n'
-        'redirect_uri = "https://<your-app>.streamlit.app/"\n'
-    )
+    st.error("Missing one of: salesforce.client_id, salesforce.client_secret, salesforce.redirect_uri")
     st.stop()
 
 AUTH_BASE = "https://login.salesforce.com/services/oauth2/authorize" if DOMAIN == "login" else "https://test.salesforce.com/services/oauth2/authorize"
 TOKEN_URL = "https://login.salesforce.com/services/oauth2/token" if DOMAIN == "login" else "https://test.salesforce.com/services/oauth2/token"
 
-# --- PKCE helpers ---
-def _b64url_no_pad(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+# ---- Helpers ----
+def _pkce_challenge(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
 
-def make_pkce():
+def _build_auth_url() -> str:
+    # Create and store verifier for this session
     verifier = secrets.token_urlsafe(64)
-    challenge = _b64url_no_pad(hashlib.sha256(verifier.encode("utf-8")).digest())
-    return verifier, challenge
+    st.session_state["pkce_verifier"] = verifier
+    challenge = _pkce_challenge(verifier)
 
-# --- Session state ---
-if "pkce_verifier" not in st.session_state:
-    st.session_state.pkce_verifier = None
-if "sf_access_token" not in st.session_state:
-    st.session_state.sf_access_token = None
-if "sf_instance_url" not in st.session_state:
-    st.session_state.sf_instance_url = None
+    params = {
+        "response_type": "code",
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "prompt": "login",
+        # If your org uses My Domain and SSO, you can sometimes help routing by using a domain-specific startURL,
+        # but keep this simple first.
+    }
+    return AUTH_BASE + "?" + urllib.parse.urlencode(params)
 
-# --- Read code/error from URL query params (Streamlit Cloud redirect lands here) ---
-qp = st.query_params  # dict-like
-code = qp.get("code")
-err = qp.get("error")
-err_desc = qp.get("error_description")
+def _exchange_code_for_token(code: str) -> dict:
+    verifier = st.session_state.get("pkce_verifier", None)
+    if not verifier:
+        raise RuntimeError("Missing PKCE verifier in session. Click the login link again to restart the flow.")
+
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "redirect_uri": REDIRECT_URI,
+        "code": code,
+        "code_verifier": verifier,
+    }
+    resp = requests.post(TOKEN_URL, data=data, timeout=30)
+    # Show a readable error if Salesforce rejects it
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Token exchange failed ({resp.status_code}): {resp.text}")
+    return resp.json()
+
+# ---- Read query params returned by Salesforce ----
+# Streamlit new API:
+code = st.query_params.get("code")
+err = st.query_params.get("error")
+err_desc = st.query_params.get("error_description")
 
 if err:
-    st.error(f"OAuth error: {err_desc or err}")
+    st.error(f"Salesforce returned error: {err}\n\n{err_desc or ''}")
     st.stop()
 
-# --- If we have an auth code, exchange it for tokens ---
-if code and (st.session_state.sf_access_token is None):
-    if not st.session_state.pkce_verifier:
-        st.error("PKCE verifier missing (session reset). Click 'Start Login' again.")
-        st.stop()
+if not code:
+    st.write("Step 1: Click below to log into Salesforce and authorize.")
+    auth_url = _build_auth_url()
+    st.link_button("Log in to Salesforce", auth_url)
 
-    with st.spinner("Exchanging code for token..."):
-        data = {
-            "grant_type": "authorization_code",
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "redirect_uri": REDIRECT_URI,
-            "code": code,
-            "code_verifier": st.session_state.pkce_verifier,
-        }
-        r = requests.post(TOKEN_URL, data=data, timeout=30)
-        if r.status_code != 200:
-            st.error(f"Token exchange failed ({r.status_code}): {r.text}")
-            st.stop()
+    st.info(
+        "If you get a redirect_uri error: your Salesforce Connected App must allow the exact callback URL:\n"
+        + REDIRECT_URI
+    )
+    st.stop()
 
-        tok = r.json()
-        st.session_state.sf_access_token = tok.get("access_token")
-        st.session_state.sf_instance_url = tok.get("instance_url")
+# ---- Exchange code for token ----
+st.write("Step 2: Exchanging authorization code for token...")
+try:
+    tok = _exchange_code_for_token(code)
+    access_token = tok.get("access_token", "")
+    instance_url = tok.get("instance_url", "")
 
-    # Clean query params so you don't keep re-exchanging on refresh
+    st.success("Connected successfully.")
+    st.write("Instance URL:", instance_url)
+
+    # Don’t print the whole token unless you absolutely need it
+    if access_token:
+        st.write("Access token (first 20 chars):", access_token[:20] + "...")
+    else:
+        st.warning("No access_token returned (unexpected). Full response below.")
+        st.json(tok)
+
+except Exception as e:
+    st.error(str(e))
+    st.stop()
+
+# Optional: clear query params so refresh doesn't re-run exchange
+if st.button("Clear URL params"):
     st.query_params.clear()
-    st.success("OAuth complete. Token stored in session for this browser tab.")
-
-# --- Buttons / UI ---
-col1, col2 = st.columns(2)
-
-with col1:
-    if st.button("Start Login"):
-        verifier, challenge = make_pkce()
-        st.session_state.pkce_verifier = verifier
-
-        params = {
-            "response_type": "code",
-            "client_id": CLIENT_ID,
-            "redirect_uri": REDIRECT_URI,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "prompt": "login",
-        }
-        auth_url = AUTH_BASE + "?" + urllib.parse.urlencode(params)
-        st.link_button("Open Salesforce Login", auth_url)
-
-with col2:
-    if st.button("Clear Session Token"):
-        st.session_state.sf_access_token = None
-        st.session_state.sf_instance_url = None
-        st.session_state.pkce_verifier = None
-        st.query_params.clear()
-        st.success("Cleared. Click Start Login again.")
-
-st.divider()
-
-# --- Test Salesforce API call ---
-if st.session_state.sf_access_token and st.session_state.sf_instance_url:
-    st.write("Instance URL:", st.session_state.sf_instance_url)
-
-    if st.button("Test API Call"):
-        try:
-            sf = Salesforce(
-                instance_url=st.session_state.sf_instance_url,
-                session_id=st.session_state.sf_access_token,
-            )
-            # very light call
-            limits = sf.limits()
-            st.success("Connected successfully.")
-            st.json(limits)
-        except Exception as e:
-            st.error(f"API call failed: {e}")
-else:
-    st.info("Click Start Login → Open Salesforce Login → complete login → you'll be redirected back here.")
+    st.rerun()
