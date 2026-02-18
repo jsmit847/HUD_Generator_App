@@ -5,15 +5,10 @@ import re
 import html
 import textwrap
 from datetime import datetime
-!pip install simple-salesforce pandas
 import pandas as pd
 import streamlit as st
 import streamlit as st
 
-sf_username = st.secrets["salesforce"]["username"]
-sf_client_id = st.secrets["salesforce"]["client_id"]
-sf_client_secret = st.secrets["salesforce"]["client_secret"]
-sf_domain = st.secrets["salesforce"].get("domain", "login")
 
 
 # =========================
