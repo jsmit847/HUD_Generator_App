@@ -6,20 +6,18 @@ import requests
 import streamlit as st
 from simple_salesforce import Salesforce
 
-st.set_page_config(page_title="Salesforce OAuth (PKCE) Test", layout="centered")
-st.title("Salesforce OAuth (PKCE) Connection Test")
+st.title("Salesforce OAuth (PKCE) Test")
 
-sf_cfg = st.secrets.get("salesforce", {})
-CLIENT_ID = sf_cfg.get("client_id") or sf_cfg.get("consumer_key")
-CLIENT_SECRET = sf_cfg.get("client_secret")  # optional depending on Connected App settings
-AUTH_HOST = (sf_cfg.get("auth_host") or "https://login.salesforce.com").rstrip("/")
-REDIRECT_URI = sf_cfg.get("redirect_uri")
+cfg = st.secrets.get("salesforce", {})
+CLIENT_ID = cfg.get("client_id") or cfg.get("consumer_key")
+AUTH_HOST = (cfg.get("auth_host") or "https://login.salesforce.com").rstrip("/")
+REDIRECT_URI = cfg.get("redirect_uri")
 
 if not CLIENT_ID or not REDIRECT_URI:
-    st.error("Missing secrets. Need: [salesforce] client_id and redirect_uri")
+    st.error('Missing secrets. Need at least: [salesforce] client_id (or consumer_key) and redirect_uri')
     st.stop()
 
-# Build endpoints from My Domain host
+# IMPORTANT: redirect_uri must match Connected App callback EXACTLY (including trailing slash or not)
 AUTH_URL = f"{AUTH_HOST}/services/oauth2/authorize"
 TOKEN_URL = f"{AUTH_HOST}/services/oauth2/token"
 
@@ -30,38 +28,27 @@ def make_code_challenge(verifier: str) -> str:
     digest = hashlib.sha256(verifier.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
 
-# --- Server-side cache for PKCE verifiers keyed by OAuth "state" ---
-@st.cache_resource
-def verifier_store():
-    # persists in the Streamlit process between reruns
-    return {}
-
-store = verifier_store()
-
-# --- Read query params after redirect ---
+# Read query params after Salesforce redirects back
 qp = st.query_params
 auth_code = qp.get("code")
 auth_error = qp.get("error")
 auth_error_desc = qp.get("error_description")
-returned_state = qp.get("state")
 
 if auth_error:
     st.error(f"OAuth error: {auth_error}\n\n{auth_error_desc or ''}")
     st.stop()
 
-# --- Step 1: Create a login URL with PKCE + state ---
+# Create verifier + state ONCE and keep them for the redirect
+if "pkce_verifier" not in st.session_state:
+    st.session_state.pkce_verifier = make_code_verifier()
 if "oauth_state" not in st.session_state:
-    st.session_state.oauth_state = secrets.token_urlsafe(16)
+    st.session_state.oauth_state = secrets.token_urlsafe(24)
 
+code_verifier = st.session_state.pkce_verifier
+code_challenge = make_code_challenge(code_verifier)
 state = st.session_state.oauth_state
 
-if state not in store:
-    # only generate verifier once per state
-    store[state] = make_code_verifier()
-
-code_verifier = store[state]
-code_challenge = make_code_challenge(code_verifier)
-
+# Build auth link
 login_params = {
     "response_type": "code",
     "client_id": CLIENT_ID,
@@ -71,38 +58,32 @@ login_params = {
     "state": state,
     "prompt": "login",
 }
-
 login_link = AUTH_URL + "?" + urllib.parse.urlencode(login_params)
 
-st.write("1) Click to authenticate with Salesforce:")
-# Use a normal link so it stays in the same tab/session more reliably
-st.markdown(f'<a href="{login_link}" target="_self">Login to Salesforce</a>', unsafe_allow_html=True)
+st.write("Step 1: Authenticate with Salesforce (opens in SAME tab to preserve PKCE verifier).")
+st.markdown(
+    f'<a href="{login_link}" target="_self">Login to Salesforce</a>',
+    unsafe_allow_html=True
+)
 
-st.divider()
-
-# --- Step 2: Exchange code for token (after redirect) ---
+# After redirect: validate state + exchange code
 if auth_code:
-    st.write("2) Authorization code received. Exchanging for token...")
-
-    # Make sure we can recover the original verifier
-    if not returned_state or returned_state not in store:
-        st.error(
-            "Missing/unknown state after redirect. This usually means the login happened in a different session/tab.\n\n"
-            "Try again by clicking the login link above (it opens in the same tab)."
-        )
+    returned_state = qp.get("state")
+    if returned_state != state:
+        st.error("State mismatch. Start over.")
+        st.session_state.pop("pkce_verifier", None)
+        st.session_state.pop("oauth_state", None)
         st.stop()
 
-    verifier_for_exchange = store[returned_state]
+    st.write("Step 2: Code received. Exchanging for token...")
 
     data = {
         "grant_type": "authorization_code",
         "client_id": CLIENT_ID,
         "redirect_uri": REDIRECT_URI,
         "code": auth_code,
-        "code_verifier": verifier_for_exchange,
+        "code_verifier": code_verifier,
     }
-    if CLIENT_SECRET:
-        data["client_secret"] = CLIENT_SECRET
 
     resp = requests.post(TOKEN_URL, data=data, timeout=30)
     if resp.status_code != 200:
@@ -117,17 +98,23 @@ if auth_code:
         st.error(f"Token response missing access_token/instance_url: {tok}")
         st.stop()
 
-    st.success("Token acquired. Creating simple-salesforce client...")
+    st.success("Token acquired.")
 
+    # Prove API works
     sf = Salesforce(instance_url=instance_url, session_id=access_token)
+    st.success("simple-salesforce client created.")
+    st.write("Instance URL:", instance_url)
 
-    st.success("Connected successfully.")
-    st.write(f"Instance URL: {instance_url}")
-    st.write(f"API Version: {sf.sf_version}")
-
-    # Optional proof call
+    # Minimal API call to confirm auth
     try:
-        ident = sf.restful("identity")
-        st.json(ident)
+        limits = sf.restful("limits")
+        st.write("API call OK (limits endpoint).")
+        st.json(limits)
     except Exception as e:
-        st.warning(f"Connected, but identity call failed (scope/permissions): {e}")
+        st.warning(f"Got token but API call failed (permissions/scopes): {e}")
+
+    # Optional: clear query params so refresh doesn't re-run the token exchange
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
