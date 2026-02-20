@@ -1,12 +1,18 @@
 # ============================================================
-# HUD Generator App — ONE-CELL DROP-IN (Streamlit) [FIXED]
-# FIXES IN THIS VERSION:
-# ✅ Removes early Workday SUP code (deal number only for now)
-# ✅ Fixes SalesforceMalformedRequest in Property__c query by:
-#    - auto-discovering which lookup fields exist on Property__c / Loan__c (Deal__c vs Opportunity__c etc.)
-#    - only querying with fields that actually exist (via describe())
-#    - safer ORDER BY (only if field exists)
-# ✅ Keeps: OAuth PKCE flow, pre-checks FIRST, user-friendly outputs, Excel download
+# HUD Generator App — ONE CELL (Streamlit) — UPDATED PRECHECKS
+# Adds REQUIRED checks BEFORE HUD can be created:
+# ✅ OSC check: match by Servicer ID / Servicer Commitment ID / Servicer Loan ID, require Primary Status == "Outside Policy In-Force"
+# ✅ CAF (formerly “ICE”) check: find property by street contains, show installment payment statuses
+# ✅ Uses your repo files:
+#    - OSC_Zstatus_COREVEST_2026-02-17_180520.xlsx
+#    - Corevest_CAF National 52874_2.10.xlsx   (also supports "(1)" filename)
+#
+# Still:
+# ✅ Salesforce OAuth PKCE
+# ✅ Deal identifier = Deal Loan Number (Deal_Loan_Number__c)
+# ✅ User-friendly (no object/field jargon)
+# ✅ Dollar inputs are blank by default (not 0.00), accept "$1,200" or "1200"
+# ✅ Excel download (no HTML)
 # ============================================================
 
 import base64
@@ -17,6 +23,7 @@ import secrets
 import time
 import urllib.parse
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -41,16 +48,6 @@ st.markdown("""
   }
   .muted { color: rgba(49,51,63,.7); font-size: 0.92rem; }
   .big { font-size: 1.05rem; }
-  [data-testid="stTextInput"] input, [data-testid="stNumberInput"] input {
-    border-radius: 10px !important;
-    padding: 10px 12px !important;
-    font-size: 1rem !important;
-  }
-  [data-testid="stDateInput"] input {
-    border-radius: 10px !important;
-    padding: 10px 12px !important;
-    font-size: 1rem !important;
-  }
   .pill {
     display:inline-block; padding: 2px 10px; border-radius: 999px;
     border: 1px solid rgba(49,51,63,.18); background: rgba(255,255,255,.7);
@@ -58,11 +55,16 @@ st.markdown("""
     margin-right: 6px;
     margin-top: 6px;
   }
+  [data-testid="stTextInput"] input, [data-testid="stNumberInput"] input, [data-testid="stDateInput"] input {
+    border-radius: 10px !important;
+    padding: 10px 12px !important;
+    font-size: 1rem !important;
+  }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("HUD Generator App (Salesforce)")
-st.caption("Enter a Deal Number → we run required checks first → then you can generate the Excel HUD.")
+st.title("HUD Generator App")
+st.caption("Enter a Deal Number → required checks run first → then you can generate the Excel HUD.")
 
 # -----------------------------
 # SECRETS
@@ -94,7 +96,6 @@ def pkce_store():
     return {}  # state -> (verifier, created_epoch)
 
 store = pkce_store()
-
 now = time.time()
 TTL = 900
 for s, (_v, t0) in list(store.items()):
@@ -145,17 +146,27 @@ def fmt_date_mmddyyyy(x) -> str:
 def normalize_text(x):
     return "" if x is None else str(x).strip()
 
-def norm_lower(x):
-    return normalize_text(x).lower()
-
 def pick_first(*vals):
     for v in vals:
         if v is None:
             continue
         s = str(v).strip()
         if s != "":
-            return v
+            return s
     return ""
+
+def digits_only(x: str) -> str:
+    return re.sub(r"\D", "", x or "")
+
+def norm(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = (
+        df.columns.astype(str)
+        .str.strip()
+        .str.lower()
+        .str.replace(r"\s+", "_", regex=True)
+    )
+    return df
 
 # -----------------------------
 # OAUTH FLOW (PKCE)
@@ -233,7 +244,7 @@ sf = Salesforce(instance_url=instance_url, session_id=access_token)
 
 topc1, topc2 = st.columns([3, 1])
 with topc1:
-    st.success("✅ Authenticated with Salesforce")
+    st.success("✅ Authenticated")
     st.caption(f"Instance: {instance_url}")
 with topc2:
     if st.button("Log out"):
@@ -243,23 +254,53 @@ with topc2:
 # -----------------------------
 # LOAD LOCAL EXCEL CHECK FILES (repo)
 # -----------------------------
-CAF_PATH = "Corevest_CAF National 52874_2.10.xlsx"
-OSC_PATH = "OSC_Zstatus_COREVEST_2026-02-17_180520.xlsx"
+OSC_CANDIDATES = [
+    "OSC_Zstatus_COREVEST_2026-02-17_180520.xlsx",
+    "OSC_Zstatus_COREVEST_2026-02-17_180520 (1).xlsx",
+]
+CAF_CANDIDATES = [
+    "Corevest_CAF National 52874_2.10.xlsx",
+    "Corevest_CAF National 52874_2.10 (1).xlsx",
+]
+
+def first_existing_path(candidates):
+    for c in candidates:
+        if Path(c).exists():
+            return c
+    return candidates[0]  # fallback name (will error inside loader if missing)
 
 @st.cache_data(show_spinner=False)
-def load_osc_excel(path=OSC_PATH):
+def load_osc_excel():
+    path = first_existing_path(OSC_CANDIDATES)
     try:
         x = pd.read_excel(path, sheet_name=None, dtype=str)
-        if "COREVEST" in x:
-            df = x["COREVEST"]
-        else:
-            df = list(x.values())[0]
-        df.columns = df.columns.astype(str).str.strip().str.lower().str.replace(r"\s+", "_", regex=True)
-        return df
-    except Exception:
-        return pd.DataFrame()
+        df = x["COREVEST"] if "COREVEST" in x else list(x.values())[0]
+        df = norm(df)
+        return df, path, None
+    except Exception as e:
+        return pd.DataFrame(), path, str(e)
 
-osc_df = load_osc_excel()
+@st.cache_data(show_spinner=False)
+def load_caf_excel():
+    path = first_existing_path(CAF_CANDIDATES)
+    try:
+        x = pd.read_excel(path, sheet_name=None, dtype=str)
+        df = list(x.values())[0]
+        df = norm(df)
+        return df, path, None
+    except Exception as e:
+        return pd.DataFrame(), path, str(e)
+
+osc_df, osc_path_used, osc_err = load_osc_excel()
+caf_df, caf_path_used, caf_err = load_caf_excel()
+
+with st.expander("Data files loaded (for troubleshooting)", expanded=False):
+    st.write("OSC file:", osc_path_used, "✅" if osc_err is None else "❌")
+    if osc_err:
+        st.code(osc_err)
+    st.write("CAF file:", caf_path_used, "✅" if caf_err is None else "❌")
+    if caf_err:
+        st.code(caf_err)
 
 # -----------------------------
 # DESCRIBE CACHES (prevents malformed SOQL)
@@ -285,7 +326,6 @@ def get_obj_fields(obj_name: str) -> set:
 def filter_existing_fields(obj_name: str, fields: list) -> list:
     existing = get_obj_fields(obj_name)
     if not existing:
-        # if describe failed, just return as-is; the query helper will still try to drop missing
         return fields
     return [f for f in fields if f in existing]
 
@@ -297,20 +337,16 @@ def choose_first_existing(obj_name: str, candidates: list) -> str | None:
     return None
 
 # -----------------------------
-# SAFE QUERY (with better error surfacing)
+# SAFE QUERY
 # -----------------------------
 def sf_query_all(sf: Salesforce, soql: str):
     return sf.query_all(soql).get("records", [])
 
 def try_query_drop_missing(sf: Salesforce, obj_name: str, fields, where_clause: str, limit=200, order_by=None):
     fields = list(fields)
-
-    # Only keep fields that exist (if describe succeeded)
     fields = filter_existing_fields(obj_name, fields)
 
-    # Only add ORDER BY if that field exists
     if order_by:
-        # order_by like "CreatedDate DESC" -> take first token as field
         ob_field = order_by.split()[0].strip()
         if ob_field not in get_obj_fields(obj_name):
             order_by = None
@@ -325,31 +361,20 @@ def try_query_drop_missing(sf: Salesforce, obj_name: str, fields, where_clause: 
             return rows, fields, soql
         except Exception as e:
             msg = str(e)
-
-            # common patterns
             m1 = re.search(r"No such column '([^']+)'", msg)
             m2 = re.search(r"Didn't understand relationship '([^']+)'", msg)
             m3 = re.search(r"Invalid field: ([^,]+)", msg)
             m4 = re.search(r"INVALID_FIELD: ([^:]+):", msg)
 
-            if m1:
-                bad = m1.group(1)
-                if bad in fields:
-                    fields.remove(bad)
-                    continue
-
-            if m3:
-                bad = m3.group(1).strip()
-                if bad in fields:
-                    fields.remove(bad)
-                    continue
-
-            if m4:
-                bad = m4.group(1).strip()
-                if bad in fields:
-                    fields.remove(bad)
-                    continue
-
+            if m1 and m1.group(1) in fields:
+                fields.remove(m1.group(1))
+                continue
+            if m3 and m3.group(1).strip() in fields:
+                fields.remove(m3.group(1).strip())
+                continue
+            if m4 and m4.group(1).strip() in fields:
+                fields.remove(m4.group(1).strip())
+                continue
             if m2:
                 relbad = m2.group(1)
                 drop = [f for f in fields if f.startswith(relbad + ".") or (("." + relbad + ".") in f)]
@@ -359,30 +384,30 @@ def try_query_drop_missing(sf: Salesforce, obj_name: str, fields, where_clause: 
                             fields.remove(f)
                     continue
 
-            # If we can't parse it, surface the SOQL to help debug quickly
             raise RuntimeError(f"Salesforce query failed.\nSOQL:\n{soql}\n\nRaw error:\n{msg}") from e
 
 # -----------------------------
 # SF FETCHES
 # -----------------------------
 def fetch_opportunity_by_deal_number(deal_number: str):
-    deal_number = re.sub(r"\D", "", (deal_number or "").strip())
-    if not deal_number:
+    dn_digits = digits_only((deal_number or "").strip())
+    if not dn_digits:
         return None
 
     opp_fields = [
         "Id", "Name", "Deal_Loan_Number__c", "Account_Name__c",
         "StageName", "CloseDate",
-        "LOC_Commitment__c",  # main commitment
-        "Amount",             # fallback
+        "LOC_Commitment__c",
+        "Amount",
+        "Servicer_Commitment_Id__c",
         "Servicer_Status__c",
         "Next_Payment_Date__c",
-        "Late_Fees_Servicer__c",  # you showed it's on Opportunity too
+        "Late_Fees_Servicer__c",
     ]
     where = (
         "("
-        f"Deal_Loan_Number__c = {soql_quote(deal_number)}"
-        f" OR Deal_Loan_Number__c LIKE {soql_quote('%' + deal_number + '%')}"
+        f"Deal_Loan_Number__c = {soql_quote(dn_digits)}"
+        f" OR Deal_Loan_Number__c LIKE {soql_quote('%' + dn_digits + '%')}"
         ")"
     )
     rows, used_fields, soql = try_query_drop_missing(
@@ -395,14 +420,12 @@ def fetch_opportunity_by_deal_number(deal_number: str):
     return r
 
 def fetch_property_for_deal(opp_id: str):
-    # discover which lookup field exists
     lk = choose_first_existing("Property__c", ["Deal__c", "Opportunity__c", "Deal_Id__c", "OpportunityId", "DealId"])
     if not lk:
-        return None  # can't link; avoid malformed query
+        return None
 
     prop_fields = [
-        "Id", "Name",
-        lk,
+        "Id", "Name", lk,
         "Servicer_Id__c",
         "Insurance_Status__c",
         "Late_Fees_Servicer__c",
@@ -421,8 +444,7 @@ def fetch_loan_for_deal(opp_id: str):
         return None
 
     loan_fields = [
-        "Id", "Name",
-        lk,
+        "Id", "Name", lk,
         "Servicer_Loan_Status__c",
         "Servicer_Loan_Id__c",
         "Next_Payment_Date__c",
@@ -436,17 +458,110 @@ def fetch_loan_for_deal(opp_id: str):
     return r
 
 # -----------------------------
-# PRECHECKS (user-friendly)
+# OFFLINE LOOKUPS (OSC + CAF)
 # -----------------------------
-TARGET_GOOD_INSURANCE = {"outside policy in-force", "outside policy in force", "in-force", "in force"}
+def osc_lookup(servicer_key: str):
+    """Match OSC by account_number. Returns dict with status + address pieces."""
+    if osc_df.empty:
+        return {"found": False, "error": "OSC file not loaded", "row": None}
+
+    if "account_number" not in osc_df.columns:
+        return {"found": False, "error": "OSC missing 'account_number' column", "row": None}
+
+    key = (servicer_key or "").strip()
+    if key == "":
+        return {"found": False, "error": "Missing servicer identifier", "row": None}
+
+    m = osc_df["account_number"].astype(str).str.strip() == key
+    hit = osc_df[m]
+    if hit.empty:
+        return {"found": False, "error": "No OSC record found", "row": None}
+
+    row = hit.iloc[0].to_dict()
+    return {"found": True, "error": None, "row": row}
+
+def detect_caf_address_col(df: pd.DataFrame):
+    """Find best guess address column in CAF."""
+    if df.empty:
+        return None
+    candidates = [
+        "property_address", "propertyaddress", "address", "site_address",
+        "property_street", "propertystreet", "street", "siteaddress"
+    ]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    # last resort: any column containing 'address'
+    for c in df.columns:
+        if "address" in c:
+            return c
+    return None
+
+def caf_lookup_by_street(property_street: str):
+    """Find CAF row where address contains OSC property_street (case-insensitive)."""
+    if caf_df.empty:
+        return {"found": False, "error": "CAF file not loaded", "row": None, "used_addr_col": None}
+
+    addr_col = detect_caf_address_col(caf_df)
+    if not addr_col:
+        return {"found": False, "error": "CAF address column not found", "row": None, "used_addr_col": None}
+
+    addr = (property_street or "").strip().lower()
+    if addr == "":
+        return {"found": False, "error": "Missing property street for CAF search", "row": None, "used_addr_col": addr_col}
+
+    ser = caf_df[addr_col].astype(str).str.lower().str.strip()
+    # contains match (old behavior)
+    hit = caf_df[ser.str.contains(re.escape(addr), na=False)]
+    if hit.empty:
+        return {"found": False, "error": "No CAF record found for that address", "row": None, "used_addr_col": addr_col}
+
+    row = hit.iloc[0].to_dict()
+    return {"found": True, "error": None, "row": row, "used_addr_col": addr_col}
+
+def pick_payment_statuses(caf_row: dict):
+    """Return installment payment statuses if present."""
+    out = []
+    if not caf_row:
+        return out
+    for col in ["inst_1_payment_status", "inst_2_payment_status", "inst_3_payment_status"]:
+        if col in caf_row:
+            v = normalize_text(caf_row.get(col))
+            if v != "":
+                out.append((col, v))
+    # also support alternate headings (in case)
+    if not out:
+        for col in caf_row.keys():
+            if "payment_status" in col and "inst" in col:
+                v = normalize_text(caf_row.get(col))
+                if v != "":
+                    out.append((col, v))
+    return out
+
+def is_payment_status_ok(val: str) -> bool:
+    """Heuristic: flag obvious bad statuses."""
+    t = (val or "").strip().lower()
+    if t == "":
+        return False
+    bad_words = ["delinquent", "late", "unpaid", "past due", "default", "foreclosure"]
+    return not any(w in t for w in bad_words)
+
+# -----------------------------
+# PRECHECKS (user-friendly, required first)
+# -----------------------------
+TARGET_OSC_PRIMARY = "outside policy in-force"
 
 def run_prechecks(opp: dict, prop: dict, loan: dict):
     deal_num = normalize_text(opp.get("Deal_Loan_Number__c"))
     deal_name = normalize_text(opp.get("Name"))
     acct_name = normalize_text(opp.get("Account_Name__c"))
 
-    servicer_id = pick_first(
+    # IMPORTANT: servicer identifier for offline checks
+    # Use the best available: Property Servicer Id -> Opportunity Servicer Commitment Id -> Loan Servicer Loan Id
+    servicer_key = pick_first(
         prop.get("Servicer_Id__c") if prop else "",
+        opp.get("Servicer_Commitment_Id__c"),
+        loan.get("Servicer_Loan_Id__c") if loan else "",
     )
 
     total_loan_amount = parse_money(pick_first(opp.get("LOC_Commitment__c"), opp.get("Amount"), 0))
@@ -456,14 +571,11 @@ def run_prechecks(opp: dict, prop: dict, loan: dict):
         opp.get("Next_Payment_Date__c"),
         ""
     )
-
     servicer_status = pick_first(
         loan.get("Servicer_Loan_Status__c") if loan else "",
         opp.get("Servicer_Status__c"),
         ""
     )
-
-    insurance_status = normalize_text(prop.get("Insurance_Status__c") if prop else "")
 
     late_fees = pick_first(
         prop.get("Late_Fees_Servicer__c") if prop else "",
@@ -472,19 +584,57 @@ def run_prechecks(opp: dict, prop: dict, loan: dict):
     )
     late_fees_num = parse_money(late_fees)
 
-    osc_primary_status = ""
-    osc_ok = None
-    if not osc_df.empty and servicer_id and "account_number" in osc_df.columns:
-        m = osc_df["account_number"].astype(str).str.strip() == str(servicer_id).strip()
-        hit = osc_df[m]
-        if not hit.empty:
-            osc_primary_status = str(hit.iloc[0].get("primary_status", "")).strip()
-            osc_ok = (osc_primary_status.strip().lower() == "outside policy in-force".lower())
+    # OSC lookup (REQUIRED)
+    osc = osc_lookup(servicer_key)
+    osc_primary = ""
+    property_street = ""
+    address_disp = ""
+    osc_ok = False
+
+    if osc["found"]:
+        r = osc["row"] or {}
+        osc_primary = normalize_text(r.get("primary_status"))
+        osc_ok = (osc_primary.strip().lower() == TARGET_OSC_PRIMARY)
+
+        street = normalize_text(r.get("property_street")).strip()
+        city = normalize_text(r.get("property_city")).strip()
+        state = normalize_text(r.get("property_state")).strip()
+        zipc = normalize_text(r.get("property_zip")).strip()
+        address_disp = f"{street} {city} {state} {zipc}".strip().upper()
+        property_street = street
+    else:
+        osc_ok = False
+
+    # CAF lookup by OSC property street (REQUIRED)
+    caf = {"found": False, "error": "CAF not checked", "row": None}
+    caf_statuses = []
+    caf_ok = False
+    if property_street.strip() != "":
+        caf = caf_lookup_by_street(property_street)
+        if caf["found"]:
+            caf_statuses = pick_payment_statuses(caf["row"])
+            # If statuses exist: OK if none look bad; if none exist: treat as review
+            if caf_statuses:
+                caf_ok = all(is_payment_status_ok(v) for (_k, v) in caf_statuses)
+            else:
+                caf_ok = False
         else:
-            osc_ok = None
+            caf_ok = False
+    else:
+        caf_ok = False
+        caf = {"found": False, "error": "Missing property street from OSC for CAF search", "row": None}
 
     checks = []
 
+    # Servicer Key presence is paramount
+    checks.append({
+        "Check": "Servicer identifier found",
+        "Value": servicer_key if servicer_key else "(blank)",
+        "Result": "✅ OK" if servicer_key else "🚫 Missing",
+        "Note": "This is required to match OSC/CAF."
+    })
+
+    # Late fees: good is $0
     checks.append({
         "Check": "Late fees (should be $0)",
         "Value": fmt_money(late_fees_num),
@@ -492,21 +642,13 @@ def run_prechecks(opp: dict, prop: dict, loan: dict):
         "Note": "Good is $0. If not $0, confirm before generating HUD."
     })
 
-    ins_ok = (norm_lower(insurance_status) in TARGET_GOOD_INSURANCE) if insurance_status else False
-    checks.append({
-        "Check": "Insurance status",
-        "Value": insurance_status if insurance_status else "(blank)",
-        "Result": "✅ OK" if ins_ok else "⚠️ Review",
-        "Note": "Should be Outside Policy In-Force (or equivalent)."
-    })
-
+    # Next payment date / servicer status (shown; not blocking by themselves)
     checks.append({
         "Check": "Servicer loan status",
         "Value": servicer_status if servicer_status else "(blank)",
         "Result": "✅ OK" if servicer_status else "⚠️ Review",
         "Note": "If blank/incorrect, update Salesforce before proceeding."
     })
-
     checks.append({
         "Check": "Next payment date",
         "Value": fmt_date_mmddyyyy(next_pay) if next_pay else "(blank)",
@@ -514,30 +656,61 @@ def run_prechecks(opp: dict, prop: dict, loan: dict):
         "Note": "If blank, confirm with servicer / update Salesforce."
     })
 
-    if osc_ok is None:
+    # OSC (blocking)
+    if not osc["found"]:
         checks.append({
-            "Check": "OSC insurance file (offline)",
-            "Value": "No match found",
-            "Result": "⚪ Not found",
-            "Note": "If needed, confirm insurance in Salesforce / OSC."
+            "Check": "OSC insurance status (required)",
+            "Value": osc["error"],
+            "Result": "🚫 Stop",
+            "Note": "No OSC record found — fix identifier or find correct loan in OSC before HUD."
         })
     else:
         checks.append({
-            "Check": "OSC insurance file (offline)",
-            "Value": osc_primary_status if osc_primary_status else "(blank)",
-            "Result": "✅ OK" if osc_ok else "⚠️ Review",
-            "Note": "If not Outside Policy In-Force, reach out before HUD."
+            "Check": "OSC insurance status (required)",
+            "Value": osc_primary if osc_primary else "(blank)",
+            "Result": "✅ OK" if osc_ok else "🚫 Stop",
+            "Note": "Must be Outside Policy In-Force — otherwise reach out before HUD."
         })
 
-    overall_ok = (late_fees_num == 0) and ins_ok
+    # CAF/ICE (blocking)
+    if not caf["found"]:
+        checks.append({
+            "Check": "CAF installment payment status (required)",
+            "Value": caf.get("error", "No CAF match"),
+            "Result": "🚫 Stop",
+            "Note": "No CAF record found for property address — confirm address/loan before HUD."
+        })
+    else:
+        if caf_statuses:
+            summary = " | ".join([f"{k}: {v}" for (k, v) in caf_statuses])
+            checks.append({
+                "Check": "CAF installment payment status (required)",
+                "Value": summary,
+                "Result": "✅ OK" if caf_ok else "⚠️ Review",
+                "Note": "Review any delinquent/late/past due statuses before HUD."
+            })
+        else:
+            checks.append({
+                "Check": "CAF installment payment status (required)",
+                "Value": "Statuses not found in CAF row",
+                "Result": "⚠️ Review",
+                "Note": "CAF row matched, but expected status columns were not found."
+            })
+
+    # Overall eligibility:
+    # Must have servicer_key + OSC OK (Outside Policy In-Force) + CAF found (and statuses present & OK)
+    overall_ok = bool(servicer_key) and osc_ok and caf["found"] and caf_statuses and caf_ok
+
     return {
         "deal_number": deal_num,
         "deal_name": deal_name,
         "account_name": acct_name,
-        "servicer_id": servicer_id,
+        "servicer_key": servicer_key,
         "total_loan_amount": total_loan_amount,
         "checks": checks,
         "overall_ok": overall_ok,
+        "address_disp": address_disp,       # from OSC
+        "property_street": property_street, # from OSC, used for CAF contains match
     }
 
 # -----------------------------
@@ -650,7 +823,7 @@ def build_hud_excel_bytes(ctx: dict) -> bytes:
     return out.getvalue()
 
 # -----------------------------
-# SESSION STATE DEFAULTS (MUST be set BEFORE widgets)
+# SESSION STATE DEFAULTS (BEFORE WIDGETS)
 # -----------------------------
 def ensure_default(key, val):
     if key not in st.session_state:
@@ -661,7 +834,7 @@ ensure_default("precheck_ran", False)
 ensure_default("precheck_payload", None)
 ensure_default("allow_override", False)
 
-# HUD inputs as TEXT (so they start blank)
+# HUD inputs as TEXT (blank defaults)
 ensure_default("inp_advance_amount", "")
 ensure_default("inp_holdback_pct", "")
 ensure_default("inp_advance_date", date.today())
@@ -676,9 +849,9 @@ ensure_default("inp_title_fee", "")
 st.markdown('<div class="soft-card">', unsafe_allow_html=True)
 c1, c2 = st.columns([2.4, 1.2])
 with c1:
-    deal_number = st.text_input("Deal Number", key="deal_number_input", placeholder="e.g., 403012345 or 12345")
+    deal_number = st.text_input("Deal Number", key="deal_number_input", placeholder="Type the deal number (Deal Loan Number)")
 with c2:
-    run_btn = st.button("Run checks", type="primary", use_container_width=True)
+    run_btn = st.button("Run required checks", type="primary", use_container_width=True)
 st.markdown("</div>", unsafe_allow_html=True)
 
 if run_btn:
@@ -686,7 +859,7 @@ if run_btn:
     st.session_state.precheck_payload = None
     st.session_state.allow_override = False
 
-    with st.spinner("Looking up deal in Salesforce..."):
+    with st.spinner("Finding deal in Salesforce..."):
         opp = fetch_opportunity_by_deal_number(deal_number)
 
     if not opp:
@@ -694,32 +867,31 @@ if run_btn:
         st.stop()
 
     opp_id = opp.get("Id")
-    with st.spinner("Pulling related Property / Loan info..."):
-        # These now cannot throw malformed query due to bad lookup fields;
-        # they will safely return None if linkage field doesn't exist.
+    with st.spinner("Pulling related info from Salesforce..."):
         prop = fetch_property_for_deal(opp_id) if opp_id else None
         loan = fetch_loan_for_deal(opp_id) if opp_id else None
 
-    payload = run_prechecks(opp, prop, loan)
+    with st.spinner("Running OSC + CAF checks..."):
+        payload = run_prechecks(opp, prop, loan)
+
     st.session_state.precheck_payload = {"opp": opp, "prop": prop, "loan": loan, "payload": payload}
     st.session_state.precheck_ran = True
 
 # -----------------------------
-# SHOW CHECK RESULTS
+# SHOW CHECK RESULTS (REQUIRED FIRST)
 # -----------------------------
 if st.session_state.precheck_ran and st.session_state.precheck_payload:
     opp = st.session_state.precheck_payload["opp"]
-    prop = st.session_state.precheck_payload["prop"]
     payload = st.session_state.precheck_payload["payload"]
 
-    st.subheader("Check results")
+    st.subheader("Required check results")
     st.markdown(f"""
 <div class="soft-card">
   <div class="big"><b>{payload['deal_number']}</b> — {payload['deal_name']}</div>
   <div class="muted">{payload['account_name']}</div>
   <div style="margin-top:8px;">
     <span class="pill">Total Loan Amount: <b>{fmt_money(payload['total_loan_amount'])}</b></span>
-    <span class="pill">Servicer ID: <b>{payload['servicer_id'] if payload['servicer_id'] else '—'}</b></span>
+    <span class="pill">Servicer Identifier: <b>{payload['servicer_key'] if payload['servicer_key'] else '—'}</b></span>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -728,32 +900,24 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload:
     st.dataframe(df_checks, use_container_width=True, hide_index=True)
 
     if payload["overall_ok"]:
-        st.success("✅ Checks look good. You can continue to build the HUD Excel.")
+        st.success("✅ All required checks passed. You can continue to build the HUD.")
         st.session_state.allow_override = True
     else:
-        st.warning("⚠️ Some checks need review before generating the HUD.")
+        st.error("🚫 Required checks did not pass — HUD should NOT be created yet.")
         st.session_state.allow_override = st.checkbox("Override and continue anyway", value=False)
 
 # -----------------------------
-# HUD INPUTS (only after checks)
+# HUD INPUTS (ONLY AFTER CHECKS)
 # -----------------------------
 if st.session_state.precheck_ran and st.session_state.precheck_payload and st.session_state.allow_override:
     opp = st.session_state.precheck_payload["opp"]
     payload = st.session_state.precheck_payload["payload"]
 
-    # Prefill borrower/address best-effort without “prefilled” text
+    # Borrower (simple + user-friendly): default to Account Name
     borrower_disp = (opp.get("Account_Name__c") or "").strip().upper()
 
-    address_disp = ""
-    if payload.get("servicer_id") and not osc_df.empty and "account_number" in osc_df.columns:
-        m = osc_df["account_number"].astype(str).str.strip() == str(payload["servicer_id"]).strip()
-        hit = osc_df[m]
-        if not hit.empty:
-            street = str(hit.iloc[0].get("property_street", "")).strip()
-            city = str(hit.iloc[0].get("property_city", "")).strip()
-            state = str(hit.iloc[0].get("property_state", "")).strip()
-            zipc = str(hit.iloc[0].get("property_zip", "")).strip()
-            address_disp = f"{street} {city} {state} {zipc}".strip().upper()
+    # Address from OSC (already built)
+    address_disp = payload.get("address_disp", "") or ""
 
     st.subheader("HUD inputs")
     st.caption("Type amounts like `1200` or `$1,200` (leave blank for $0).")
@@ -796,7 +960,7 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload and st.se
             except Exception:
                 pass
 
-        # NOTE: These SF-funded fields may not exist in your org; they default to 0.
+        # These may not exist in your org → default 0 (safe)
         sf_initial_advance = parse_money(opp.get("Initial_Disbursement_Funded__c")) if "Initial_Disbursement_Funded__c" in opp else 0.0
         sf_total_reno = parse_money(opp.get("Renovation_HB_Funded__c")) if "Renovation_HB_Funded__c" in opp else 0.0
         sf_interest_reserve = parse_money(opp.get("Interest_Allocation_Funded__c")) if "Interest_Allocation_Funded__c" in opp else 0.0
