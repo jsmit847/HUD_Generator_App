@@ -590,6 +590,7 @@ with tab_inputs:
         holdback_current_raw = c1.text_input("Holdback % Current (optional override)", placeholder="leave blank to use Salesforce ratio")
         holdback_closing_raw = c2.text_input("Holdback % at Closing", placeholder="100")
         advance_date_raw = c3.text_input("Advance Date", placeholder="MM/DD/YYYY")
+        workday_sup_code_input = st.text_input("Workday SUP Code (manual)")
 
         st.markdown("**Fees (manual):**")
         f1, f2, f3, f4 = st.columns(4)
@@ -683,7 +684,7 @@ with tab_inputs:
         "holdback_closing": holdback_closing,
         "advance_date": parse_date_to_mmddyyyy(advance_date_raw),
 
-        "workday_sup_code": str(workday_sup_code).strip(),
+        "workday_sup_code": str(workday_sup_code_input).strip(),
         "borrower_disp": borrower_name,
         "address_disp": address_full,
 
