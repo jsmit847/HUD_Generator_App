@@ -1,5 +1,5 @@
 # =========================
-# HUD GENERATOR (APP.PY)
+# HUD GENERATOR (APP.PY) — SALESFORCE VERSION (Hayden removed)
 # =========================
 import re
 import html
@@ -7,9 +7,10 @@ import textwrap
 from datetime import datetime
 import pandas as pd
 import streamlit as st
-import streamlit as st
 
-
+from simple_salesforce import Salesforce
+import keyring
+import truststore
 
 # =========================
 # PAGE CONFIG
@@ -19,6 +20,21 @@ st.set_page_config(
     page_icon="🏗️",
     layout="wide",
 )
+
+# =========================
+# AUTH / SALESFORCE CLIENT
+# =========================
+truststore.inject_into_ssl()
+
+SERVICE = "salesforce_prod_oauth"  # same as your notebook
+instance_url = keyring.get_password(SERVICE, "instance_url")
+access_token = keyring.get_password(SERVICE, "access_token")
+
+if not instance_url or not access_token:
+    st.error("Missing Salesforce token in keyring. Run your OAuth flow first.")
+    st.stop()
+
+sf = Salesforce(instance_url=instance_url, session_id=access_token)
 
 # =========================
 # HELPERS
@@ -33,34 +49,22 @@ def norm(df: pd.DataFrame) -> pd.DataFrame:
     )
     return df
 
-
 def parse_money(val) -> float:
-    """
-    Accepts:
-      12345.67
-      "12,345.67"
-      "$12,345.67"
-      "(12,345.67)" -> negative
-      "" / None -> 0.0
-    """
     if val is None:
         return 0.0
     s = str(val).strip()
     if s == "" or s.lower() in {"nan", "none"}:
         return 0.0
-
     s = s.replace("$", "").replace(",", "")
     neg = False
     if s.startswith("(") and s.endswith(")"):
         neg = True
         s = s[1:-1]
-
     try:
         x = float(s)
     except Exception:
         return 0.0
     return -x if neg else x
-
 
 def fmt_money(x) -> str:
     try:
@@ -68,15 +72,7 @@ def fmt_money(x) -> str:
     except Exception:
         return "$0.00"
 
-
 def normalize_pct(s: str) -> str:
-    """
-    Accepts:
-      "100" -> "100%"
-      "100%" -> "100%"
-      "1" -> "100%" (interprets 0<val<=1 as ratio)
-      "" -> ""
-    """
     t = str(s).strip()
     if t == "":
         return ""
@@ -85,24 +81,30 @@ def normalize_pct(s: str) -> str:
         v = float(t)
     except Exception:
         return ""
-
     if 0 < v <= 1:
         v *= 100
     return f"{v:.0f}%"
 
+def ratio_to_pct_str(x) -> str:
+    """
+    Salesforce ratio/percent display:
+    - If 0 < x <= 1 => ratio => *100
+    - If x > 1 => already percent-like
+    """
+    if x is None or str(x).strip() == "":
+        return ""
+    try:
+        v = float(x)
+    except Exception:
+        return str(x).strip()
+    if 0 < v <= 1:
+        v *= 100
+    return f"{v:.0f}%"
 
 def parse_date_to_mmddyyyy(s: str) -> str:
-    """
-    Accepts:
-      20260114 -> 01/14/2026
-      01-14-2026 -> 01/14/2026
-      1/14/26 -> 01/14/2026
-      "" -> ""
-    """
     t = str(s).strip()
     if t == "":
         return ""
-
     digits = re.sub(r"\D", "", t)
     if len(digits) == 8:
         yyyy = int(digits[:4])
@@ -114,13 +116,11 @@ def parse_date_to_mmddyyyy(s: str) -> str:
             return dt.strftime("%m/%d/%Y")
         except Exception:
             pass
-
     try:
         dt = pd.to_datetime(t, errors="raise")
         return dt.strftime("%m/%d/%Y")
     except Exception:
         return ""
-
 
 def safe_first(df: pd.DataFrame, col: str, default=""):
     if df is None or df.empty:
@@ -129,13 +129,11 @@ def safe_first(df: pd.DataFrame, col: str, default=""):
         return default
     return df[col].iloc[0]
 
-
 def first_present_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     for c in candidates:
         if c in df.columns:
             return c
     return None
-
 
 def require_cols(df: pd.DataFrame, cols: list[str], dataset_name: str):
     missing = [c for c in cols if c not in df.columns]
@@ -143,33 +141,29 @@ def require_cols(df: pd.DataFrame, cols: list[str], dataset_name: str):
         st.error(
             f"Missing expected column(s) in **{dataset_name}**: "
             + ", ".join([f"`{m}`" for m in missing])
-            + "\n\nTip: confirm the correct sheet + header row for this file."
         )
         st.stop()
 
-
 def recompute(ctx: dict) -> dict:
-    # Per your HUD notes: Allocated Loan Amount = Advance Amount + Total Reno Drawn
+    # Allocated Loan Amount = Advance Amount + Total Reno Drawn
     ctx["allocated_loan_amount"] = float(ctx.get("advance_amount", 0.0)) + float(ctx.get("total_reno_drawn", 0.0))
 
-    # Construction Advance Amount: keep as the "Advance Amount" (manual, construction team)
+    # Construction Advance Amount: keep as the "Advance Amount" (manual)
     ctx["construction_advance_amount"] = float(ctx.get("advance_amount", 0.0))
 
     # Fees
     fee_keys = ["inspection_fee", "wire_fee", "construction_mgmt_fee", "title_fee"]
     ctx["total_fees"] = sum(float(ctx.get(k, 0.0)) for k in fee_keys)
 
-    # Optional: include late charges in HUD charges section (does NOT block generation)
+    # Optional late charges line item
     include_lates = bool(ctx.get("include_late_charges", False))
     late_charges = float(ctx.get("accrued_late_charges_amt", 0.0))
     ctx["late_charges_line_item"] = late_charges if include_lates else 0.0
 
-    # Net Amount to Borrower = Construction Advance Amount - (Total Fees + Optional Late Charges)
+    # Net Amount to Borrower = Advance Amount - (Fees + Optional Lates)
     ctx["net_amount_to_borrower"] = ctx["construction_advance_amount"] - ctx["total_fees"] - ctx["late_charges_line_item"]
 
-    # Available Balance (your new test rule)
-    # Total Loan Amount minus everything below it (excluding fees to avoid double-counting,
-    # because fees are part of the advance distribution)
+    # Available Balance rule (your test rule)
     ctx["available_balance"] = (
         float(ctx.get("total_loan_amount", 0.0))
         - float(ctx.get("initial_advance", 0.0))
@@ -179,12 +173,10 @@ def recompute(ctx: dict) -> dict:
     )
     return ctx
 
-
 def render_hud_html(ctx: dict) -> str:
     company_name = "COREVEST AMERICAN FINANCE LENDER LLC"
     company_addr = "4 Park Plaza, Suite 900, Irvine, CA 92614"
 
-    # Escape user/data text so you never accidentally break HTML
     borrower_disp = html.escape(str(ctx.get("borrower_disp", "") or ""))
     address_disp = html.escape(str(ctx.get("address_disp", "") or ""))
     workday_sup_code = html.escape(str(ctx.get("workday_sup_code", "") or ""))
@@ -194,7 +186,9 @@ def render_hud_html(ctx: dict) -> str:
     hb_current = html.escape(str(ctx.get("holdback_current", "") or ""))
     hb_closing = html.escape(str(ctx.get("holdback_closing", "") or ""))
 
-    # Late fees display (HUD line item optional)
+    # Yardi vendor code (new)
+    yardi_vendor_code = html.escape(str(ctx.get("yardi_vendor_code", "") or ""))
+
     show_lates = bool(ctx.get("include_late_charges", False))
 
     html_str = f"""
@@ -211,7 +205,7 @@ def render_hud_html(ctx: dict) -> str:
     line-height: 1.25;
   }}
   .hud-top .c1 {{ font-weight: 700; }}
-  .hud-top .c3 {{ font-weight: 800; font-size: 16px; }} /* Final Settlement Statement bold */
+  .hud-top .c3 {{ font-weight: 800; font-size: 16px; }}
   .hud-box {{
     border: 2px solid #000;
     padding: 10px;
@@ -304,7 +298,7 @@ def render_hud_html(ctx: dict) -> str:
         <td class="rlbl">Workday SUP Code:</td><td class="rval grid">{workday_sup_code}</td>
       </tr>
       <tr>
-        <td class="lbl"></td><td class="val"></td>
+        <td class="lbl">Yardi Vendor Code:</td><td class="val grid">{yardi_vendor_code}</td>
         <td class="rlbl">Advance Date:</td><td class="rval grid"><span class="bold">{advance_date}</span></td>
       </tr>
     </table>
@@ -329,32 +323,18 @@ def render_hud_html(ctx: dict) -> str:
   </table>
 </div>
 """
-    # CRITICAL FIX: remove leading indentation so Streamlit doesn't treat it like a Markdown code block.
     return textwrap.dedent(html_str).strip()
 
-
 # =========================
-# STATE
-# =========================
-if "data" not in st.session_state:
-    st.session_state.data = None  # will hold dict of dataframes
-
-
-# =========================
-# HEADER
+# LOAD NON-SF FILES (keep these as-is for now)
 # =========================
 st.title("🏗️ HUD Generator")
 st.caption("Upload once • Validate deals • Generate HUD • Edit after preview • Export HTML")
 
-
-# =========================
-# SIDEBAR — FILE UPLOADS (LOAD ONCE)
-# =========================
 with st.sidebar:
     st.header("📂 Files (upload once)")
 
     fci_file = st.file_uploader("FCI Loan Detail_RSLD (CSV)", type=["csv"], key="fci_upl")
-    hayden_file = st.file_uploader("Hayden Active Loans (XLSX)", type=["xlsx"], key="hayden_upl")
     ice_file = st.file_uploader("ICE Updated Taxes (XLSX)", type=["xlsx"], key="ice_upl")
     osc_file = st.file_uploader("OSC ZStatus (XLSX)", type=["xlsx"], key="osc_upl")
 
@@ -365,27 +345,20 @@ with st.sidebar:
     st.divider()
     st.caption("Tip: After you load files once, you can run multiple deals without re-uploading.")
 
+if "data" not in st.session_state:
+    st.session_state.data = None
+
 if clear_clicked:
     st.session_state.data = None
     st.success("Cleared loaded data. Re-upload files when ready.")
     st.stop()
 
 @st.cache_data(show_spinner=False)
-def load_all(fci_upl, hayden_upl, ice_upl, osc_upl):
+def load_all(fci_upl, ice_upl, osc_upl):
     try:
         fci_df = norm(pd.read_csv(fci_upl, sep="|", engine="python", dtype=str, na_filter=False))
     except Exception as e:
         raise RuntimeError(f"Could not read FCI CSV. Is it pipe-delimited (|)?\n\nDetails: {e}")
-
-    try:
-        asset = norm(pd.read_excel(hayden_upl, sheet_name="Bridge Asset", skiprows=3, dtype=str))
-        loan = norm(pd.read_excel(hayden_upl, sheet_name="Bridge Loan", skiprows=3, dtype=str))
-    except Exception as e:
-        raise RuntimeError(
-            "Could not read Hayden workbook.\n"
-            "Expected sheets: 'Bridge Asset' and 'Bridge Loan' with header starting after 3 rows.\n\n"
-            f"Details: {e}"
-        )
 
     try:
         ice_df = norm(pd.read_excel(ice_upl, sheet_name="Detail2", skiprows=2, dtype=str))
@@ -405,40 +378,92 @@ def load_all(fci_upl, hayden_upl, ice_upl, osc_upl):
             f"Details: {e}"
         )
 
-    return {"fci": fci_df, "bridge_asset": asset, "bridge_loan": loan, "ice": ice_df, "osc": osc_df}
-
+    return {"fci": fci_df, "ice": ice_df, "osc": osc_df}
 
 if load_clicked:
-    if not all([fci_file, hayden_file, ice_file, osc_file]):
-        st.sidebar.error("Please upload all 4 files before clicking Load.")
+    if not all([fci_file, ice_file, osc_file]):
+        st.sidebar.error("Please upload FCI + ICE + OSC before clicking Load.")
     else:
         try:
-            st.session_state.data = load_all(fci_file, hayden_file, ice_file, osc_file)
+            st.session_state.data = load_all(fci_file, ice_file, osc_file)
             st.sidebar.success("Files loaded. You can now generate HUDs.")
         except Exception as e:
             st.sidebar.error(str(e))
 
-
 if st.session_state.data is None:
-    st.info("Upload all 4 files in the sidebar, then click **Load / Reload**.")
+    st.info("Upload **FCI + ICE + OSC** in the sidebar, then click **Load / Reload**.")
     st.stop()
 
-# Pull dfs
 fci = st.session_state.data["fci"]
-bridge_asset = st.session_state.data["bridge_asset"]
-bridge_loan = st.session_state.data["bridge_loan"]
 ice = st.session_state.data["ice"]
 osc = st.session_state.data["osc"]
 
-# =========================
-# BASIC COLUMN EXPECTATIONS (FRIENDLY FAIL FAST)
-# =========================
-require_cols(bridge_asset, ["deal_number", "servicer_id"], "Hayden - Bridge Asset")
-require_cols(bridge_loan,  ["deal_number", "servicer_id"], "Hayden - Bridge Loan")
 require_cols(fci, ["account"], "FCI")
 require_cols(osc, ["account_number", "primary_status"], "OSC")
 
-# Hayden money fields may exist in one sheet but not the other; we’ll validate after selecting the row.
+# =========================
+# SALESFORCE FETCHERS
+# =========================
+def sf_money(x) -> float:
+    try:
+        if x is None or x == "":
+            return 0.0
+        return float(x)
+    except Exception:
+        return 0.0
+
+def sf_text(x) -> str:
+    return ("" if x is None else str(x)).strip()
+
+def fetch_property_by_yardi(yardi_id: str) -> dict | None:
+    # Try with Account__c first; if your org uses a different lookup name, we fall back.
+    fields_try = [
+        "Id",
+        "Borrower_Name__c",
+        "Full_Address__c",
+        "Yardi_Id__c",
+        "Initial_Disbursement_Used__c",
+        "Renovation_Advance_Amount_Used__c",
+        "Interest_Allocation__c",
+        "Holdback_To_Rehab_Ratio__c",
+        "Account__c",
+    ]
+
+    while True:
+        soql = f"SELECT {', '.join(fields_try)} FROM Property__c WHERE Yardi_Id__c = '{yardi_id}' LIMIT 1"
+        try:
+            rows = sf.query_all(soql).get("records", [])
+            return rows[0] if rows else None
+        except Exception as e:
+            msg = str(e)
+            m = re.search(r"No such column '([^']+)'", msg)
+            if m:
+                bad = m.group(1)
+                if bad in fields_try:
+                    fields_try.remove(bad)
+                    continue
+            raise
+
+def fetch_latest_advance_for_property(property_id: str) -> dict:
+    # you can add more fields as you discover them
+    soql = f"""
+    SELECT Id, LOC_Commitment__c, Wire_Date__c, CreatedDate
+    FROM Advance__c
+    WHERE Property__c = '{property_id}'
+    ORDER BY CreatedDate DESC
+    LIMIT 1
+    """.strip()
+    rows = sf.query_all(soql).get("records", [])
+    return rows[0] if rows else {}
+
+def fetch_account_vendor_code(account_id: str) -> str:
+    if not account_id:
+        return ""
+    soql = f"SELECT Id, Yardi_Vendor_Code__c FROM Account WHERE Id = '{account_id}' LIMIT 1"
+    rows = sf.query_all(soql).get("records", [])
+    if not rows:
+        return ""
+    return sf_text(rows[0].get("Yardi_Vendor_Code__c"))
 
 # =========================
 # MAIN UI
@@ -449,13 +474,13 @@ with tab_inputs:
     st.subheader("Deal Inputs")
 
     with st.form("inputs_form"):
-        deal_number = st.text_input("Deal Number", placeholder="58439")
+        deal_number = st.text_input("Deal Number (Yardi ID)", placeholder="58439")
         advance_amount = st.number_input("Advance Amount", min_value=0.0, step=0.01, format="%.2f")
 
         c1, c2, c3 = st.columns(3)
-        holdback_current_raw = c1.text_input("Holdback % Current", placeholder="100")
-        holdback_closing_raw = c2.text_input("Holdback % at Closing", placeholder="100")
-        advance_date_raw = c3.text_input("Advance Date", placeholder="MM/DD/YYYY")
+        holdback_current_raw = c1.text_input("Holdback % Current (optional override)", placeholder="(leave blank to use SF)")
+        holdback_closing_raw = c2.text_input("Holdback % at Closing (manual for now)", placeholder="100")
+        advance_date_raw = c3.text_input("Advance Date (optional override)", placeholder="MM/DD/YYYY")
 
         st.markdown("**Fees (manual):**")
         f1, f2, f3, f4 = st.columns(4)
@@ -473,34 +498,33 @@ with tab_inputs:
 
     deal_number = str(deal_number).strip()
     if deal_number == "":
-        st.error("Deal Number is required.")
+        st.error("Deal Number (Yardi ID) is required.")
         st.stop()
 
     # =========================
-    # LOOKUPS
+    # SALESFORCE LOOKUP (replaces Hayden)
     # =========================
-    loan_hit = bridge_loan.loc[bridge_loan["deal_number"].astype(str).str.strip() == deal_number]
-    asset_hit = bridge_asset.loc[bridge_asset["deal_number"].astype(str).str.strip() == deal_number]
-
-    if not loan_hit.empty:
-        hayden_row = loan_hit.iloc[0]
-        hayden_sheet = "Bridge Loan"
-    elif not asset_hit.empty:
-        hayden_row = asset_hit.iloc[0]
-        hayden_sheet = "Bridge Asset"
-    else:
-        st.error("Deal Number not found in Hayden (Bridge Loan or Bridge Asset).")
+    prop = fetch_property_by_yardi(deal_number)
+    if not prop:
+        st.error("Deal Number (Yardi ID) not found in Salesforce Property__c.Yardi_Id__c.")
         st.stop()
 
-    servicer_id = str(hayden_row.get("servicer_id", "")).strip()
-    if servicer_id == "":
-        st.error(f"Servicer ID missing for this deal in Hayden ({hayden_sheet}).")
-        st.stop()
+    adv = fetch_latest_advance_for_property(prop["Id"])
+
+    account_id = prop.get("Account__c")  # may be missing if your lookup is named differently
+    yardi_vendor_code = fetch_account_vendor_code(account_id) if account_id else ""
+
+    # =========================
+    # Servicer ID replacement strategy (for now)
+    # =========================
+    # Your old flow keyed FCI/OSC off servicer_id. Until we find the Salesforce equivalent,
+    # use Yardi ID as the "servicer_id" placeholder so the joins still run.
+    servicer_id = deal_number
 
     # FCI match (do NOT block on late charges)
     fci_match = fci[fci["account"].astype(str).str.strip() == servicer_id]
     if fci_match.empty:
-        st.error("No matching FCI record found for this Servicer ID (Account).")
+        st.error("No matching FCI record found for this ID (currently using Yardi ID as Account key).")
         st.stop()
 
     next_payment_due = safe_first(fci_match, "nextpaymentdue", "")
@@ -513,7 +537,7 @@ with tab_inputs:
     # OSC match (policy check)
     osc_match = osc[osc["account_number"].astype(str).str.strip() == servicer_id]
     if osc_match.empty:
-        st.error("No OSC record found for this Servicer ID (Account Number).")
+        st.error("No OSC record found for this ID (currently using Yardi ID as Account Number key).")
         st.stop()
 
     primary_status = safe_first(osc_match, "primary_status", "")
@@ -521,15 +545,18 @@ with tab_inputs:
         st.error("🚨 OSC Primary Status is NOT Outside Policy In-Force — reach out to the borrower.")
         st.stop()
 
-    # Build Address from OSC
-    street = str(safe_first(osc_match, "property_street", "")).strip()
-    city = str(safe_first(osc_match, "property_city", "")).strip()
-    state = str(safe_first(osc_match, "property_state", "")).strip()
-    zipc = str(safe_first(osc_match, "property_zip", "")).strip()
+    # Address display: prefer Salesforce Full_Address__c; if blank, fall back to OSC parts like before
+    sf_full_addr = sf_text(prop.get("Full_Address__c"))
+    if sf_full_addr:
+        address_disp = sf_full_addr.upper()
+    else:
+        street = str(safe_first(osc_match, "property_street", "")).strip()
+        city = str(safe_first(osc_match, "property_city", "")).strip()
+        state = str(safe_first(osc_match, "property_state", "")).strip()
+        zipc = str(safe_first(osc_match, "property_zip", "")).strip()
+        address_disp = " ".join([p for p in [street, city, state, zipc] if p]).strip().upper()
 
-    address_disp = " ".join([p for p in [street, city, state, zipc] if p]).strip().upper()
-
-    # ICE optional check (best-effort)
+    # ICE optional check (best-effort match)
     ice_addr_col = first_present_col(ice, ["property_address", "propertyaddress", "address", "site_address"])
     ice_status = {}
     if ice_addr_col and str(property_street).strip():
@@ -542,45 +569,47 @@ with tab_inputs:
                     ice_status[col] = ice_match[col].iloc[0]
 
     # =========================
-    # BUILD CONTEXT (HAYDEN -> underscore columns)
+    # BUILD CONTEXT (Salesforce replaces Hayden fields)
     # =========================
-    def hayden_money(field_under_score: str) -> float:
-        return parse_money(hayden_row.get(field_under_score, ""))
+    total_loan_amount = sf_money(adv.get("LOC_Commitment__c"))                # Loan Commitment -> Advance__c.LOC_Commitment__c
+    initial_advance   = sf_money(prop.get("Initial_Disbursement_Used__c"))    # Initial Disbursement Funded -> Property__c.Initial_Disbursement_Used__c
+    total_reno_drawn  = sf_money(prop.get("Renovation_Advance_Amount_Used__c"))  # Total Reno Drawn -> Property__c.Renovation_Advance_Amount_Used__c
+    interest_reserve  = sf_money(prop.get("Interest_Allocation__c"))          # Interest Reserve -> Property__c.Interest_Allocation__c
 
-    # These *may* vary by sheet; we will warn but not crash:
-    needed_hayden_fields = [
-        "loan_commitment",
-        "initial_disbursement_funded",
-        "renovation_hb_funded",
-        "interest_allocation_funded",
-        "borrower_name",
-        "financing",
-    ]
-    missing_hayden = [c for c in needed_hayden_fields if c not in hayden_row.index]
-    if missing_hayden:
-        st.warning(
-            "Some expected fields were not found in the selected Hayden sheet "
-            f"(**{hayden_sheet}**): {', '.join([f'`{m}`' for m in missing_hayden])}\n\n"
-            "HUD will still generate, but missing fields may show as blank/0.00."
-        )
+    sf_holdback_current = ratio_to_pct_str(prop.get("Holdback_To_Rehab_Ratio__c"))  # Holdback % Current -> ratio field
+    holdback_current = normalize_pct(holdback_current_raw) if str(holdback_current_raw).strip() else sf_holdback_current
+
+    holdback_closing = normalize_pct(holdback_closing_raw)
+
+    # Advance date: default from latest Advance__c.Wire_Date__c; allow manual override
+    sf_advance_date = parse_date_to_mmddyyyy(sf_text(adv.get("Wire_Date__c")))
+    advance_date = parse_date_to_mmddyyyy(advance_date_raw) if str(advance_date_raw).strip() else sf_advance_date
+
+    # Borrower name from SF; fallback empty
+    borrower_disp = sf_text(prop.get("Borrower_Name__c")).upper()
+
+    # Workday SUP Code: not found yet → keep blank placeholder
+    workday_sup_code = ""
 
     ctx = {
         "deal_number": deal_number,
         "servicer_id": servicer_id,
 
-        "total_loan_amount": hayden_money("loan_commitment"),
-        "initial_advance": hayden_money("initial_disbursement_funded"),
-        "total_reno_drawn": hayden_money("renovation_hb_funded"),
-        "interest_reserve": hayden_money("interest_allocation_funded"),
+        "total_loan_amount": total_loan_amount,
+        "initial_advance": initial_advance,
+        "total_reno_drawn": total_reno_drawn,
+        "interest_reserve": interest_reserve,
 
         "advance_amount": float(advance_amount),
 
-        "holdback_current": normalize_pct(holdback_current_raw),
-        "holdback_closing": normalize_pct(holdback_closing_raw),
-        "advance_date": parse_date_to_mmddyyyy(advance_date_raw),
+        "holdback_current": holdback_current,
+        "holdback_closing": holdback_closing,
+        "advance_date": advance_date,
 
-        "workday_sup_code": str(hayden_row.get("financing", "")).strip(),
-        "borrower_disp": str(hayden_row.get("borrower_name", "")).strip().upper(),
+        "workday_sup_code": workday_sup_code,
+        "yardi_vendor_code": yardi_vendor_code,
+
+        "borrower_disp": borrower_disp,
         "address_disp": address_disp,
 
         "inspection_fee": float(inspection_fee),
@@ -588,7 +617,6 @@ with tab_inputs:
         "construction_mgmt_fee": float(construction_mgmt_fee),
         "title_fee": float(title_fee),
 
-        # Late charges (display always; include in HUD optionally)
         "accrued_late_charges_raw": str(accrued_late_charges_raw),
         "accrued_late_charges_amt": float(accrued_late_charges_amt),
         "include_late_charges": bool(include_late_charges),
@@ -596,15 +624,18 @@ with tab_inputs:
 
     ctx = recompute(ctx)
 
-    # Store output context for Results tab
     st.session_state["last_ctx"] = ctx
     st.session_state["last_snapshot"] = {
-        "hayden_sheet": hayden_sheet,
         "primary_status": primary_status,
         "next_payment_due": next_payment_due,
         "status_enum": status_enum,
         "accrued_late_charges_raw": accrued_late_charges_raw,
         "ice_status": ice_status,
+
+        # debug / audit
+        "sf_property_id": prop.get("Id"),
+        "sf_advance_id": adv.get("Id"),
+        "sf_account_id": account_id,
     }
 
 with tab_results:
@@ -617,33 +648,38 @@ with tab_results:
 
     st.subheader("Validation Snapshot")
     a, b, c, d = st.columns(4)
-    a.metric("Deal", ctx.get("deal_number", ""))
-    b.metric("Servicer ID", ctx.get("servicer_id", ""))
-    c.metric("Hayden Sheet", snap.get("hayden_sheet", ""))
+    a.metric("Deal (Yardi ID)", ctx.get("deal_number", ""))
+    b.metric("Servicer ID (temp)", ctx.get("servicer_id", ""))
+    c.metric("SF Property Id", snap.get("sf_property_id", ""))
     d.metric("OSC Primary Status", snap.get("primary_status", ""))
 
     e, f, g = st.columns(3)
     e.metric("FCI Next Payment Due", snap.get("next_payment_due", ""))
     f.metric("FCI Status Enum", snap.get("status_enum", ""))
-    fci_lates_disp = snap.get("accrued_late_charges_raw", "")
-    g.metric("FCI Accrued Late Charges", fci_lates_disp if fci_lates_disp else "0")
+    g.metric("FCI Accrued Late Charges", snap.get("accrued_late_charges_raw", "") or "0")
 
     if snap.get("ice_status"):
         with st.expander("ICE Installment Status (best-effort match)"):
             st.json(snap["ice_status"])
 
+    with st.expander("Debug (Salesforce IDs)"):
+        st.json({
+            "sf_property_id": snap.get("sf_property_id"),
+            "sf_advance_id": snap.get("sf_advance_id"),
+            "sf_account_id": snap.get("sf_account_id"),
+            "yardi_vendor_code": ctx.get("yardi_vendor_code"),
+        })
+
     st.divider()
 
     st.subheader("HUD Preview")
-    hud_html = render_hud_html(ctx)
-    st.markdown(hud_html, unsafe_allow_html=True)
+    st.markdown(render_hud_html(ctx), unsafe_allow_html=True)
 
     st.divider()
 
     st.subheader("Edit After Preview (updates HUD)")
     st.caption("Edit values below, click **Apply Edits**, then re-download the HTML.")
 
-    # Editable key/value grid
     editable_rows = [
         ("Total Loan Amount", ctx["total_loan_amount"], "money"),
         ("Initial Advance", ctx["initial_advance"], "money"),
@@ -654,6 +690,7 @@ with tab_results:
         ("Holdback % at Closing", ctx.get("holdback_closing", ""), "text"),
         ("Advance Date", ctx.get("advance_date", ""), "text"),
         ("Workday SUP Code", ctx.get("workday_sup_code", ""), "text"),
+        ("Yardi Vendor Code", ctx.get("yardi_vendor_code", ""), "text"),
         ("Borrower", ctx.get("borrower_disp", ""), "text"),
         ("Address", ctx.get("address_disp", ""), "text"),
         ("3rd party Inspection Fee", ctx["inspection_fee"], "money"),
@@ -676,7 +713,6 @@ with tab_results:
     )
 
     if st.button("Apply Edits ✅"):
-        # Map edited values back into ctx safely
         by_field = dict(zip(edited["Field"], edited["Value"]))
 
         ctx["total_loan_amount"] = parse_money(by_field.get("Total Loan Amount"))
@@ -690,6 +726,8 @@ with tab_results:
         ctx["advance_date"] = parse_date_to_mmddyyyy(by_field.get("Advance Date"))
 
         ctx["workday_sup_code"] = str(by_field.get("Workday SUP Code", "")).strip()
+        ctx["yardi_vendor_code"] = str(by_field.get("Yardi Vendor Code", "")).strip()
+
         ctx["borrower_disp"] = str(by_field.get("Borrower", "")).strip().upper()
         ctx["address_disp"] = str(by_field.get("Address", "")).strip().upper()
 
@@ -698,9 +736,7 @@ with tab_results:
         ctx["construction_mgmt_fee"] = float(parse_money(by_field.get("Construction Management Fee")))
         ctx["title_fee"] = float(parse_money(by_field.get("Title Fee")))
 
-        # Late charge toggle
-        include_flag = by_field.get("Include Late Charges Line Item", False)
-        ctx["include_late_charges"] = bool(include_flag)
+        ctx["include_late_charges"] = bool(by_field.get("Include Late Charges Line Item", False))
 
         ctx = recompute(ctx)
         st.session_state["last_ctx"] = ctx
