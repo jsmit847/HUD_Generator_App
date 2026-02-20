@@ -1,6 +1,6 @@
 # =========================
-# HUD GENERATOR (APP.PY) — SALESFORCE-ONLY (NO HAYDEN, NO FCI)
-# OAuth Authorization Code + PKCE using Streamlit secrets
+# HUD GENERATOR (APP.PY) — TEST-STYLE OAUTH PKCE + SALESFORCE DATA
+# No Hayden. No FCI. OSC + CAF from repo files.
 # =========================
 import re
 import html
@@ -9,6 +9,7 @@ import base64
 import hashlib
 import secrets
 import urllib.parse
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -17,20 +18,22 @@ import requests
 import streamlit as st
 from simple_salesforce import Salesforce
 
-# =========================
-# PAGE CONFIG
-# =========================
+# -------------------------
+# Page
+# -------------------------
 st.set_page_config(page_title="HUD Generator", page_icon="🏗️", layout="wide")
+st.title("🏗️ HUD Generator")
+st.caption("Salesforce-only deal data (no Hayden/FCI). OSC + CAF loaded from repo.")
 
-# =========================
-# REPO FILE PATHS (in same repo)
-# =========================
-DEFAULT_CAF_PATH = Path("Corevest_CAF National 52874_2.10.xlsx")
-DEFAULT_OSC_PATH = Path("OSC_Zstatus_COREVEST_2026-02-17_180520.xlsx")
+# -------------------------
+# Repo files (must exist in repo root)
+# -------------------------
+CAF_PATH = Path("Corevest_CAF National 52874_2.10.xlsx")
+OSC_PATH = Path("OSC_Zstatus_COREVEST_2026-02-17_180520.xlsx")
 
-# =========================
-# HELPERS
-# =========================
+# -------------------------
+# Helpers
+# -------------------------
 def norm(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = (
@@ -109,13 +112,6 @@ def parse_date_to_mmddyyyy(s: str) -> str:
     except Exception:
         return ""
 
-def safe_first(df: pd.DataFrame, col: str, default=""):
-    if df is None or df.empty:
-        return default
-    if col not in df.columns:
-        return default
-    return df[col].iloc[0]
-
 def require_cols(df: pd.DataFrame, cols: list[str], dataset_name: str):
     missing = [c for c in cols if c not in df.columns]
     if missing:
@@ -126,18 +122,25 @@ def require_cols(df: pd.DataFrame, cols: list[str], dataset_name: str):
         st.stop()
 
 def recompute(ctx: dict) -> dict:
+    # Allocated Loan Amount = Advance Amount + Total Reno Drawn
     ctx["allocated_loan_amount"] = float(ctx.get("advance_amount", 0.0)) + float(ctx.get("total_reno_drawn", 0.0))
+
+    # Construction Advance Amount = Advance Amount
     ctx["construction_advance_amount"] = float(ctx.get("advance_amount", 0.0))
 
+    # Fees
     fee_keys = ["inspection_fee", "wire_fee", "construction_mgmt_fee", "title_fee"]
     ctx["total_fees"] = sum(float(ctx.get(k, 0.0)) for k in fee_keys)
 
+    # Optional late charges line item (SF Late Fees)
     include_lates = bool(ctx.get("include_late_charges", False))
     late_charges = float(ctx.get("accrued_late_charges_amt", 0.0))
     ctx["late_charges_line_item"] = late_charges if include_lates else 0.0
 
+    # Net Amount to Borrower
     ctx["net_amount_to_borrower"] = ctx["construction_advance_amount"] - ctx["total_fees"] - ctx["late_charges_line_item"]
 
+    # Available Balance (same logic you had)
     ctx["available_balance"] = (
         float(ctx.get("total_loan_amount", 0.0))
         - float(ctx.get("initial_advance", 0.0))
@@ -287,7 +290,7 @@ def render_hud_html(ctx: dict) -> str:
     <tr><td>Wire Fee</td><td>{fmt_money(ctx.get("wire_fee", 0.0))}</td></tr>
     <tr><td>Construction Management Fee</td><td>{fmt_money(ctx.get("construction_mgmt_fee", 0.0))}</td></tr>
     <tr><td>Title Fee</td><td>{fmt_money(ctx.get("title_fee", 0.0))}</td></tr>
-    {"<tr><td>Accrued Late Charges</td><td>" + fmt_money(ctx.get("late_charges_line_item", 0.0)) + "</td></tr>" if show_lates else ""}
+    {"<tr><td>Late Fees (Servicer)</td><td>" + fmt_money(ctx.get("late_charges_line_item", 0.0)) + "</td></tr>" if show_lates else ""}
     <tr class="tot"><td>Total Fees</td><td>{fmt_money(ctx.get("total_fees", 0.0) + (ctx.get("late_charges_line_item",0.0) if show_lates else 0.0))}</td></tr>
     <tr class="tot"><td>Reimbursement to Borrower</td><td>{fmt_money(ctx.get("net_amount_to_borrower", 0.0))}</td></tr>
   </table>
@@ -295,79 +298,193 @@ def render_hud_html(ctx: dict) -> str:
 """
     return textwrap.dedent(html_str).strip()
 
-# =========================
-# SALESFORCE OAUTH PKCE
-# =========================
-def b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
+# -------------------------
+# Secrets (same as your test)
+# -------------------------
+cfg = st.secrets["salesforce"]
+CLIENT_ID = cfg["client_id"]
+AUTH_HOST = cfg.get("auth_host", "https://login.salesforce.com").rstrip("/")
+REDIRECT_URI = cfg["redirect_uri"]
+CLIENT_SECRET = cfg.get("client_secret")  # optional
+API_VERSION = str(cfg.get("api_version", "59.0"))
 
-def pkce_pair():
-    verifier = b64url(secrets.token_bytes(32))
-    challenge = b64url(hashlib.sha256(verifier.encode("utf-8")).digest())
-    return verifier, challenge
+AUTH_URL = f"{AUTH_HOST}/services/oauth2/authorize"
+TOKEN_URL = f"{AUTH_HOST}/services/oauth2/token"
 
-def get_sf_secrets():
-    if "salesforce" not in st.secrets:
-        st.error("Missing [salesforce] in Streamlit secrets.")
-        st.stop()
-    s = st.secrets["salesforce"]
-    # Must exist in secrets; do not print them
-    for k in ["client_id", "client_secret", "auth_host", "redirect_uri"]:
-        if not s.get(k):
-            st.error(f"Missing salesforce secret key: {k}")
-            st.stop()
-    return s
+# -------------------------
+# PKCE helpers (same as your test)
+# -------------------------
+def b64url_no_pad(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("utf-8")
 
-def oauth_login_button(auth_host, client_id, redirect_uri, scope="refresh_token api"):
-    if "pkce_verifier" not in st.session_state:
-        v, c = pkce_pair()
-        st.session_state.pkce_verifier = v
-        st.session_state.pkce_challenge = c
-        st.session_state.oauth_state = b64url(secrets.token_bytes(16))
+def make_verifier() -> str:
+    v = secrets.token_urlsafe(96)
+    return v[:128]
 
-    params = {
-        "response_type": "code",
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "code_challenge": st.session_state.pkce_challenge,
-        "code_challenge_method": "S256",
-        "state": st.session_state.oauth_state,
-        "scope": scope,
-    }
-    auth_url = f"{auth_host}/services/oauth2/authorize?{urllib.parse.urlencode(params)}"
-    st.link_button("🔑 Login to Salesforce", auth_url, use_container_width=True)
+def make_challenge(verifier: str) -> str:
+    return b64url_no_pad(hashlib.sha256(verifier.encode("utf-8")).digest())
 
-def exchange_code_for_token(auth_host, client_id, client_secret, redirect_uri, code, code_verifier):
-    token_url = f"{auth_host}/services/oauth2/token"
+@st.cache_resource
+def pkce_store():
+    return {}  # state -> (verifier, created_epoch)
+
+store = pkce_store()
+
+# cleanup old states
+now = time.time()
+TTL = 600
+for s, (_v, t0) in list(store.items()):
+    if now - t0 > TTL:
+        store.pop(s, None)
+
+# -------------------------
+# OAuth flow (same structure)
+# -------------------------
+qp = st.query_params
+code = qp.get("code")
+state = qp.get("state")
+err = qp.get("error")
+err_desc = qp.get("error_description")
+
+if err:
+    st.error(f"OAuth error: {err}")
+    if err_desc:
+        st.code(err_desc)
+    st.stop()
+
+if "sf_token" not in st.session_state:
+    st.session_state.sf_token = None
+
+def exchange_code_for_token(code: str, verifier: str) -> dict:
     data = {
         "grant_type": "authorization_code",
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
         "code": code,
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "redirect_uri": redirect_uri,
-        "code_verifier": code_verifier,
+        "code_verifier": verifier,
     }
-    resp = requests.post(token_url, data=data, timeout=30)
-    resp.raise_for_status()
+    if CLIENT_SECRET:
+        data["client_secret"] = CLIENT_SECRET
+    resp = requests.post(TOKEN_URL, data=data, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Token exchange failed ({resp.status_code}): {resp.text}")
     return resp.json()
 
-@st.cache_resource(show_spinner=False)
-def sf_from_token(instance_url: str, access_token: str, api_version="59.0"):
-    return Salesforce(instance_url=instance_url, session_id=access_token, version=api_version)
+# handle redirect
+if code:
+    if not state or state not in store:
+        st.error("Missing/expired OAuth state. Click login again.")
+        st.stop()
+    verifier, _t0 = store.pop(state)
+    tok = exchange_code_for_token(code, verifier)
+    st.session_state.sf_token = tok
+    st.query_params.clear()
+    st.rerun()
 
+# no token yet -> login
+if not st.session_state.sf_token:
+    new_state = secrets.token_urlsafe(24)
+    new_verifier = make_verifier()
+    new_challenge = make_challenge(new_verifier)
+    store[new_state] = (new_verifier, time.time())
+
+    login_params = {
+        "response_type": "code",
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "code_challenge": new_challenge,
+        "code_challenge_method": "S256",
+        "state": new_state,
+        "prompt": "login",
+        "scope": "api refresh_token",
+    }
+    login_url = AUTH_URL + "?" + urllib.parse.urlencode(login_params)
+    st.info("Step 1: Authenticate with Salesforce.")
+    st.link_button("Login to Salesforce", login_url, use_container_width=True)
+    with st.expander("Debug"):
+        st.write("AUTH_HOST:", AUTH_HOST)
+        st.write("REDIRECT_URI:", REDIRECT_URI)
+    st.stop()
+
+# -------------------------
+# Token -> Salesforce client
+# -------------------------
+tok = st.session_state.sf_token
+access_token = tok.get("access_token")
+instance_url = tok.get("instance_url")
+id_url = tok.get("id")
+
+if not access_token or not instance_url:
+    st.error("Token missing access_token/instance_url")
+    st.json({k: tok.get(k) for k in ["instance_url", "id", "issued_at", "scope", "token_type"]})
+    st.stop()
+
+sf = Salesforce(instance_url=instance_url, session_id=access_token, version=API_VERSION)
+
+c1, c2 = st.columns([2, 1])
+with c1:
+    st.success("✅ Authenticated")
+    st.write("instance_url:", instance_url)
+with c2:
+    if st.button("Log out / Clear token"):
+        st.session_state.sf_token = None
+        st.rerun()
+
+with st.expander("Identity (proof it's you)"):
+    if id_url:
+        headers = {"Authorization": f"Bearer {access_token}"}
+        r = requests.get(id_url, headers=headers, timeout=30)
+        st.write("status:", r.status_code)
+        try:
+            st.json(r.json())
+        except Exception:
+            st.write(r.text)
+
+# -------------------------
+# Load OSC + CAF from repo
+# -------------------------
+@st.cache_data(show_spinner=False)
+def load_osc(path: Path) -> pd.DataFrame:
+    df = pd.read_excel(path, sheet_name="COREVEST", dtype=str)
+    df = norm(df)
+    require_cols(df, ["account_number", "primary_status"], "OSC ZStatus")
+    return df
+
+@st.cache_data(show_spinner=False)
+def load_caf(path: Path) -> pd.DataFrame:
+    df = pd.read_excel(path, sheet_name=0, dtype=str)
+    return norm(df)
+
+osc_df = None
+caf_df = None
+
+if OSC_PATH.exists():
+    osc_df = load_osc(OSC_PATH)
+else:
+    st.warning(f"OSC file not found: {OSC_PATH}")
+
+if CAF_PATH.exists():
+    caf_df = load_caf(CAF_PATH)
+else:
+    st.warning(f"CAF file not found: {CAF_PATH}")
+
+# -------------------------
+# SOQL helpers
+# -------------------------
 def soql_quote(s: str) -> str:
     return "'" + str(s).replace("\\", "\\\\").replace("'", "\\'") + "'"
 
-def sf_one(sf, soql: str) -> dict | None:
+def sf_one(soql: str) -> dict | None:
     res = sf.query(soql)
     recs = res.get("records", [])
     return recs[0] if recs else None
 
-def find_property_by_input(sf, user_input: str) -> dict | None:
-    q = user_input.strip()
+def find_property_by_key(user_key: str) -> dict | None:
+    q = user_key.strip()
     if not q:
         return None
-    soql_base = """
+
+    base = """
     SELECT Id, Name,
            Yardi_Id__c, Servicer_Id__c,
            Borrower_Name__c, Full_Address__c,
@@ -383,19 +500,20 @@ def find_property_by_input(sf, user_input: str) -> dict | None:
     FROM Property__c
     """
 
-    rec = sf_one(sf, f"{soql_base} WHERE Yardi_Id__c = {soql_quote(q)} LIMIT 1")
+    # exact Yardi
+    rec = sf_one(f"{base} WHERE Yardi_Id__c = {soql_quote(q)} LIMIT 1")
     if rec:
         return rec
-
-    rec = sf_one(sf, f"{soql_base} WHERE Servicer_Id__c = {soql_quote(q)} LIMIT 1")
+    # exact Servicer Id
+    rec = sf_one(f"{base} WHERE Servicer_Id__c = {soql_quote(q)} LIMIT 1")
     if rec:
         return rec
-
+    # fallback: partial on Yardi
     like = "%" + q.replace("%", "\\%") + "%"
-    rec = sf_one(sf, f"{soql_base} WHERE Yardi_Id__c LIKE {soql_quote(like)} LIMIT 1")
+    rec = sf_one(f"{base} WHERE Yardi_Id__c LIKE {soql_quote(like)} LIMIT 1")
     return rec
 
-def find_loan(sf, loan_id: str) -> dict | None:
+def find_loan(loan_id: str) -> dict | None:
     if not loan_id:
         return None
     soql = f"""
@@ -407,9 +525,9 @@ def find_loan(sf, loan_id: str) -> dict | None:
     WHERE Id = {soql_quote(loan_id)}
     LIMIT 1
     """.strip()
-    return sf_one(sf, soql)
+    return sf_one(soql)
 
-def find_opportunity(sf, opp_id: str) -> dict | None:
+def find_opportunity(opp_id: str) -> dict | None:
     if not opp_id:
         return None
     soql = f"""
@@ -420,9 +538,9 @@ def find_opportunity(sf, opp_id: str) -> dict | None:
     WHERE Id = {soql_quote(opp_id)}
     LIMIT 1
     """.strip()
-    return sf_one(sf, soql)
+    return sf_one(soql)
 
-def find_account(sf, acct_id: str) -> dict | None:
+def find_account(acct_id: str) -> dict | None:
     if not acct_id:
         return None
     soql = f"""
@@ -432,17 +550,16 @@ def find_account(sf, acct_id: str) -> dict | None:
     WHERE Id = {soql_quote(acct_id)}
     LIMIT 1
     """.strip()
-    return sf_one(sf, soql)
+    return sf_one(soql)
 
-def find_commitment_from_advance(sf, property_rec: dict) -> float:
-    # Try common relationship fields; adjust if your org uses a different link.
+def find_commitment_from_advance(property_rec: dict) -> float:
+    # Try the newest Advance__c related to the property/opportunity
     prop_id = property_rec.get("Id")
     opp_id = property_rec.get("Opportunity__c")
 
     candidates = [
         ("Property__c", prop_id),
         ("Opportunity__c", opp_id),
-        ("Deal__c", opp_id),
     ]
     for field, val in candidates:
         if not val:
@@ -454,98 +571,14 @@ def find_commitment_from_advance(sf, property_rec: dict) -> float:
         ORDER BY CreatedDate DESC
         LIMIT 1
         """.strip()
-        rec = sf_one(sf, soql)
+        rec = sf_one(soql)
         if rec and rec.get("LOC_Commitment__c") is not None:
             return float(rec.get("LOC_Commitment__c") or 0.0)
     return 0.0
 
-# =========================
-# LOAD OSC + CAF FROM REPO
-# =========================
-@st.cache_data(show_spinner=False)
-def load_osc(path: Path) -> pd.DataFrame:
-    df = pd.read_excel(path, sheet_name="COREVEST", dtype=str)
-    return norm(df)
-
-@st.cache_data(show_spinner=False)
-def load_caf(path: Path) -> pd.DataFrame:
-    df = pd.read_excel(path, sheet_name=0, dtype=str)
-    return norm(df)
-
-# =========================
-# APP
-# =========================
-st.title("🏗️ HUD Generator")
-st.caption("Salesforce-only deal data (no Hayden/FCI). OSC + CAF loaded from repo.")
-
-sf_secret = get_sf_secrets()
-client_id = sf_secret["client_id"]
-client_secret = sf_secret["client_secret"]
-auth_host = sf_secret["auth_host"].rstrip("/")
-redirect_uri = sf_secret["redirect_uri"].strip()
-api_version = str(sf_secret.get("api_version", "59.0"))
-
-# Read OAuth callback params
-params = st.query_params
-code = params.get("code", None)
-state = params.get("state", None)
-
-# Login section
-if "sf_token" not in st.session_state:
-    st.session_state.sf_token = None
-
-if st.session_state.sf_token is None:
-    oauth_login_button(auth_host, client_id, redirect_uri)
-
-    if code:
-        # verify state
-        if not st.session_state.get("oauth_state") or state != st.session_state.oauth_state:
-            st.error("OAuth state mismatch. Click Login again.")
-            st.stop()
-
-        try:
-            tok = exchange_code_for_token(
-                auth_host=auth_host,
-                client_id=client_id,
-                client_secret=client_secret,
-                redirect_uri=redirect_uri,
-                code=code,
-                code_verifier=st.session_state.pkce_verifier,
-            )
-            st.session_state.sf_token = tok
-            # Clear query params so refresh doesn't re-exchange
-            st.query_params.clear()
-            st.success("Salesforce connected ✅")
-        except Exception as e:
-            st.error(f"Token exchange failed: {e}")
-            st.stop()
-    else:
-        st.stop()
-
-tok = st.session_state.sf_token
-access_token = tok.get("access_token", "")
-instance_url = tok.get("instance_url", "") or auth_host
-if not access_token:
-    st.error("Missing access_token after OAuth.")
-    st.stop()
-
-sf = sf_from_token(instance_url, access_token, api_version=api_version)
-
-# Load OSC/CAF from repo
-osc_df = None
-caf_df = None
-if DEFAULT_OSC_PATH.exists():
-    osc_df = load_osc(DEFAULT_OSC_PATH)
-    require_cols(osc_df, ["account_number", "primary_status"], "OSC ZStatus")
-else:
-    st.warning(f"OSC file not found in repo: {DEFAULT_OSC_PATH}")
-
-if DEFAULT_CAF_PATH.exists():
-    caf_df = load_caf(DEFAULT_CAF_PATH)
-else:
-    st.warning(f"CAF file not found in repo: {DEFAULT_CAF_PATH}")
-
-# Tabs
+# -------------------------
+# UI
+# -------------------------
 tab_inputs, tab_results = st.tabs(["🧾 Inputs", "📄 Results / Export"])
 
 with tab_inputs:
@@ -577,7 +610,7 @@ with tab_inputs:
         st.error("Deal Identifier required.")
         st.stop()
 
-    prop = find_property_by_input(sf, deal_key)
+    prop = find_property_by_key(deal_key)
     if not prop:
         st.error("No matching Property__c found using Yardi_Id__c or Servicer_Id__c.")
         st.stop()
@@ -585,26 +618,30 @@ with tab_inputs:
     deal_number_display = prop.get("Yardi_Id__c") or deal_key
     servicer_id = (prop.get("Servicer_Id__c") or "").strip()
 
-    loan = find_loan(sf, prop.get("Loan__c")) if prop.get("Loan__c") else None
-    opp = find_opportunity(sf, prop.get("Opportunity__c")) if prop.get("Opportunity__c") else None
-    acct = find_account(sf, prop.get("Account__c")) if prop.get("Account__c") else None
+    loan = find_loan(prop.get("Loan__c")) if prop.get("Loan__c") else None
+    opp  = find_opportunity(prop.get("Opportunity__c")) if prop.get("Opportunity__c") else None
+    acct = find_account(prop.get("Account__c")) if prop.get("Account__c") else None
 
-    total_loan_amount = find_commitment_from_advance(sf, prop)
-    initial_advance = float(prop.get("Initial_Disbursement_Used__c") or 0.0)
-    total_reno_drawn = float(prop.get("Renovation_Advance_Amount_Used__c") or 0.0)
-    interest_reserve = float(prop.get("Interest_Allocation__c") or 0.0)
+    # HUD numbers from SF fields you provided
+    total_loan_amount = find_commitment_from_advance(prop)                    # LOC_Commitment__c on Advance__c (latest related)
+    initial_advance   = float(prop.get("Initial_Disbursement_Used__c") or 0)  # Property__c
+    total_reno_drawn  = float(prop.get("Renovation_Advance_Amount_Used__c") or 0)  # Property__c
+    interest_reserve  = float(prop.get("Interest_Allocation__c") or 0)        # Property__c
 
     borrower_name = (prop.get("Borrower_Name__c") or "").strip().upper()
-    address_full = (prop.get("Full_Address__c") or "").strip().upper()
+    address_full  = (prop.get("Full_Address__c") or "").strip().upper()
 
+    # Holdback current from SF ratio unless overridden
     sf_holdback_current = ratio_to_pct_str(prop.get("Holdback_To_Rehab_Ratio__c"))
     holdback_current = normalize_pct(holdback_current_raw) if holdback_current_raw.strip() else sf_holdback_current
     holdback_closing = normalize_pct(holdback_closing_raw)
 
-    late_fees_prop = prop.get("Late_Fees_Servicer__c")
-    late_fees_opp = opp.get("Late_Fees_Servicer__c") if opp else None
-    late_fees_amt = float(late_fees_prop or late_fees_opp or 0.0)
+    # Late fees (prefer Property; fallback Opportunity)
+    late_prop = prop.get("Late_Fees_Servicer__c")
+    late_opp  = opp.get("Late_Fees_Servicer__c") if opp else None
+    late_fees_amt = float(late_prop or late_opp or 0.0)
 
+    # Next payment date (prefer Loan; fallback Opp; fallback Property)
     next_payment = None
     if loan and loan.get("Next_Payment_Date__c"):
         next_payment = loan.get("Next_Payment_Date__c")
@@ -614,27 +651,23 @@ with tab_inputs:
         next_payment = prop.get("Next_Payment_Date__c")
     next_payment_disp = parse_date_to_mmddyyyy(next_payment) if next_payment else ""
 
+    # "StatusEnum" replacement -> Servicer Loan Status (Loan__c)
     servicer_loan_status = (loan.get("Servicer_Loan_Status__c") if loan else "") or ""
     servicer_loan_id = (loan.get("Servicer_Loan_Id__c") if loan else "") or ""
+
+    # Workday SUP Code replacement -> Yardi Vendor Code on Account (you asked this)
     workday_sup_code = (acct.get("Yardi_Vendor_Code__c") if acct else "") or ""
 
-    # OSC check + address fallback
+    # OSC policy check
     primary_status = ""
     if osc_df is not None and servicer_id:
         osc_match = osc_df[osc_df["account_number"].astype(str).str.strip() == servicer_id]
         if not osc_match.empty:
-            primary_status = safe_first(osc_match, "primary_status", "")
+            primary_status = (osc_match["primary_status"].iloc[0] or "")
             if primary_status != "Outside Policy In-Force":
                 st.error("🚨 OSC Primary Status is NOT Outside Policy In-Force — reach out to the borrower.")
                 st.stop()
-            if not address_full:
-                street = str(safe_first(osc_match, "property_street", "")).strip()
-                city   = str(safe_first(osc_match, "property_city", "")).strip()
-                state  = str(safe_first(osc_match, "property_state", "")).strip()
-                zipc   = str(safe_first(osc_match, "property_zip", "")).strip()
-                address_full = " ".join([p for p in [street, city, state, zipc] if p]).strip().upper()
 
-    # ctx
     ctx = {
         "deal_number": deal_number_display,
         "servicer_id": servicer_id,
@@ -659,6 +692,7 @@ with tab_inputs:
         "construction_mgmt_fee": float(construction_mgmt_fee),
         "title_fee": float(title_fee),
 
+        # "accruedlatecharges" replacement -> Late Fees Servicer (SF)
         "accrued_late_charges_amt": float(late_fees_amt),
         "include_late_charges": bool(include_late_charges),
     }
