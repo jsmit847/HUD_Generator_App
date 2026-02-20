@@ -1,42 +1,32 @@
 # =========================
-# HUD GENERATOR (APP.PY) — SALESFORCE + FCI/OSC/ICE FILES
-# Replaces Hayden with Salesforce fields you mapped:
-#   Total Loan Amount            <- Advance__c.LOC_Commitment__c (max for deal)
-#   Initial Advance              <- Property__c.Initial_Disbursement_Used__c
-#   Total Reno Drawn             <- Property__c.Renovation_Advance_Amount_Used__c
-#   Interest Reserve             <- Property__c.Interest_Allocation__c
-#   Holdback % Current           <- Property__c.Holdback_To_Rehab_Ratio__c (ratio -> percent display)
-#   Borrower                     <- Property__c.Borrower_Name__c
-#   Address                      <- Property__c.Full_Address__c (fallback to OSC address)
-#   Yardi ID                     <- Property__c.Yardi_Id__c
-#   Servicer ID (for FCI/OSC)     <- Property__c.Servicer_Id__c  (fallback options shown)
-#   Yardi Vendor Code            <- Account.Yardi_Vendor_Code__c (via Opportunity.AccountId)
-#
-# Keeps file uploads:
-#   FCI (CSV pipe-delim) -> nextpaymentdue/statusenum/accruedlatecharges
-#   OSC (XLSX)           -> policy check + address fallback
-#   ICE (XLSX)           -> optional best-effort match
-#
-# Notes:
-# - You MUST provide an authenticated `sf` (simple_salesforce.Salesforce) OR set
-#   SF_INSTANCE_URL and SF_ACCESS_TOKEN env vars OR stash them in st.session_state.
+# HUD GENERATOR (APP.PY) — SALESFORCE-ONLY (NO HAYDEN, NO FCI)
+# OAuth Authorization Code + PKCE using Streamlit secrets
 # =========================
-
-import os
 import re
 import html
 import textwrap
+import base64
+import hashlib
+import secrets
+import urllib.parse
 from datetime import datetime
-import pandas as pd
-import streamlit as st
+from pathlib import Path
 
-# Salesforce
+import pandas as pd
+import requests
+import streamlit as st
 from simple_salesforce import Salesforce
 
 # =========================
 # PAGE CONFIG
 # =========================
 st.set_page_config(page_title="HUD Generator", page_icon="🏗️", layout="wide")
+
+# =========================
+# REPO FILE PATHS (in same repo)
+# =========================
+DEFAULT_CAF_PATH = Path("Corevest_CAF National 52874_2.10.xlsx")
+DEFAULT_OSC_PATH = Path("OSC_Zstatus_COREVEST_2026-02-17_180520.xlsx")
 
 # =========================
 # HELPERS
@@ -55,7 +45,7 @@ def parse_money(val) -> float:
     if val is None:
         return 0.0
     s = str(val).strip()
-    if s == "" or s.lower() in {"nan", "none", "<na>"}:
+    if s == "" or s.lower() in {"nan", "none"}:
         return 0.0
     s = s.replace("$", "").replace(",", "")
     neg = False
@@ -87,18 +77,16 @@ def normalize_pct(s: str) -> str:
         v *= 100
     return f"{v:.0f}%"
 
-def ratio_to_pct_display(v) -> str:
-    """Salesforce ratio might come in as 0.85 or '0.85'. Display as '85%'."""
-    if v is None:
+def ratio_to_pct_str(x) -> str:
+    if x is None or str(x).strip() == "":
         return ""
     try:
-        f = float(str(v).strip())
+        v = float(str(x).replace("%", "").strip())
     except Exception:
         return ""
-    # if it looks like a percent already (e.g., 85), keep it
-    if f > 1.5:
-        return f"{f:.0f}%"
-    return f"{(f * 100):.0f}%"
+    if 0 < v <= 1:
+        v *= 100
+    return f"{v:.0f}%"
 
 def parse_date_to_mmddyyyy(s: str) -> str:
     t = str(s).strip()
@@ -122,15 +110,11 @@ def parse_date_to_mmddyyyy(s: str) -> str:
         return ""
 
 def safe_first(df: pd.DataFrame, col: str, default=""):
-    if df is None or df.empty or col not in df.columns:
+    if df is None or df.empty:
+        return default
+    if col not in df.columns:
         return default
     return df[col].iloc[0]
-
-def first_present_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
 
 def require_cols(df: pd.DataFrame, cols: list[str], dataset_name: str):
     missing = [c for c in cols if c not in df.columns]
@@ -138,33 +122,22 @@ def require_cols(df: pd.DataFrame, cols: list[str], dataset_name: str):
         st.error(
             f"Missing expected column(s) in **{dataset_name}**: "
             + ", ".join([f"`{m}`" for m in missing])
-            + "\n\nTip: confirm the correct sheet + header row for this file."
         )
         st.stop()
 
-def soql_quote(s: str) -> str:
-    return "'" + str(s).replace("\\", "\\\\").replace("'", "\\'") + "'"
-
 def recompute(ctx: dict) -> dict:
-    # Allocated Loan Amount = Advance Amount + Total Reno Drawn
     ctx["allocated_loan_amount"] = float(ctx.get("advance_amount", 0.0)) + float(ctx.get("total_reno_drawn", 0.0))
-
-    # Construction Advance Amount = Advance Amount (manual)
     ctx["construction_advance_amount"] = float(ctx.get("advance_amount", 0.0))
 
-    # Fees
     fee_keys = ["inspection_fee", "wire_fee", "construction_mgmt_fee", "title_fee"]
     ctx["total_fees"] = sum(float(ctx.get(k, 0.0)) for k in fee_keys)
 
-    # Optional late charges
     include_lates = bool(ctx.get("include_late_charges", False))
     late_charges = float(ctx.get("accrued_late_charges_amt", 0.0))
     ctx["late_charges_line_item"] = late_charges if include_lates else 0.0
 
-    # Net Amount to Borrower
     ctx["net_amount_to_borrower"] = ctx["construction_advance_amount"] - ctx["total_fees"] - ctx["late_charges_line_item"]
 
-    # Available Balance
     ctx["available_balance"] = (
         float(ctx.get("total_loan_amount", 0.0))
         - float(ctx.get("initial_advance", 0.0))
@@ -179,9 +152,9 @@ def render_hud_html(ctx: dict) -> str:
     company_addr = "4 Park Plaza, Suite 900, Irvine, CA 92614"
 
     borrower_disp = html.escape(str(ctx.get("borrower_disp", "") or ""))
-    address_disp = html.escape(str(ctx.get("address_disp", "") or ""))
+    address_disp  = html.escape(str(ctx.get("address_disp", "") or ""))
     workday_sup_code = html.escape(str(ctx.get("workday_sup_code", "") or ""))
-    advance_date = html.escape(str(ctx.get("advance_date", "") or ""))
+    advance_date  = html.escape(str(ctx.get("advance_date", "") or ""))
 
     hb_current = html.escape(str(ctx.get("holdback_current", "") or ""))
     hb_closing = html.escape(str(ctx.get("holdback_closing", "") or ""))
@@ -323,218 +296,265 @@ def render_hud_html(ctx: dict) -> str:
     return textwrap.dedent(html_str).strip()
 
 # =========================
-# SALESFORCE CONNECTION
+# SALESFORCE OAUTH PKCE
 # =========================
-def get_sf() -> Salesforce | None:
-    """
-    Priority:
-      1) st.session_state['sf_instance_url'], ['sf_access_token'] (your OAuth flow can set these)
-      2) env vars: SF_INSTANCE_URL, SF_ACCESS_TOKEN
-    """
-    instance_url = st.session_state.get("sf_instance_url") or os.getenv("SF_INSTANCE_URL", "")
-    access_token = st.session_state.get("sf_access_token") or os.getenv("SF_ACCESS_TOKEN", "")
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
 
-    if not instance_url or not access_token:
+def pkce_pair():
+    verifier = b64url(secrets.token_bytes(32))
+    challenge = b64url(hashlib.sha256(verifier.encode("utf-8")).digest())
+    return verifier, challenge
+
+def get_sf_secrets():
+    if "salesforce" not in st.secrets:
+        st.error("Missing [salesforce] in Streamlit secrets.")
+        st.stop()
+    s = st.secrets["salesforce"]
+    # Must exist in secrets; do not print them
+    for k in ["client_id", "client_secret", "auth_host", "redirect_uri"]:
+        if not s.get(k):
+            st.error(f"Missing salesforce secret key: {k}")
+            st.stop()
+    return s
+
+def oauth_login_button(auth_host, client_id, redirect_uri, scope="refresh_token api"):
+    if "pkce_verifier" not in st.session_state:
+        v, c = pkce_pair()
+        st.session_state.pkce_verifier = v
+        st.session_state.pkce_challenge = c
+        st.session_state.oauth_state = b64url(secrets.token_bytes(16))
+
+    params = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": st.session_state.pkce_challenge,
+        "code_challenge_method": "S256",
+        "state": st.session_state.oauth_state,
+        "scope": scope,
+    }
+    auth_url = f"{auth_host}/services/oauth2/authorize?{urllib.parse.urlencode(params)}"
+    st.link_button("🔑 Login to Salesforce", auth_url, use_container_width=True)
+
+def exchange_code_for_token(auth_host, client_id, client_secret, redirect_uri, code, code_verifier):
+    token_url = f"{auth_host}/services/oauth2/token"
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+        "code_verifier": code_verifier,
+    }
+    resp = requests.post(token_url, data=data, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+@st.cache_resource(show_spinner=False)
+def sf_from_token(instance_url: str, access_token: str, api_version="59.0"):
+    return Salesforce(instance_url=instance_url, session_id=access_token, version=api_version)
+
+def soql_quote(s: str) -> str:
+    return "'" + str(s).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+def sf_one(sf, soql: str) -> dict | None:
+    res = sf.query(soql)
+    recs = res.get("records", [])
+    return recs[0] if recs else None
+
+def find_property_by_input(sf, user_input: str) -> dict | None:
+    q = user_input.strip()
+    if not q:
         return None
-    return Salesforce(instance_url=instance_url, session_id=access_token)
-
-sf = get_sf()
-
-# =========================
-# HEADER
-# =========================
-st.title("🏗️ HUD Generator")
-st.caption("Salesforce (replaces Hayden) • Upload once for FCI/OSC/ICE • Generate HUD • Edit after preview • Export HTML")
-
-if sf is None:
-    st.warning(
-        "Salesforce is not connected.\n\n"
-        "Set either:\n"
-        "- `st.session_state['sf_instance_url']` and `st.session_state['sf_access_token']` (from your OAuth flow), OR\n"
-        "- env vars `SF_INSTANCE_URL` and `SF_ACCESS_TOKEN`.\n\n"
-        "Then rerun."
-    )
-    st.stop()
-
-# =========================
-# SIDEBAR — FILE UPLOADS (LOAD ONCE)
-# =========================
-with st.sidebar:
-    st.header("📂 Files (upload once)")
-    fci_file = st.file_uploader("FCI Loan Detail_RSLD (CSV, pipe |)", type=["csv"], key="fci_upl")
-    ice_file = st.file_uploader("ICE Updated Taxes (XLSX)", type=["xlsx"], key="ice_upl")
-    osc_file = st.file_uploader("OSC ZStatus (XLSX)", type=["xlsx"], key="osc_upl")
-
-    cA, cB = st.columns(2)
-    load_clicked = cA.button("✅ Load / Reload", use_container_width=True)
-    clear_clicked = cB.button("🧹 Clear", use_container_width=True)
-
-    st.divider()
-    st.caption("Tip: After you load files once, you can run multiple deals without re-uploading.")
-
-if "data" not in st.session_state:
-    st.session_state.data = None
-
-if clear_clicked:
-    st.session_state.data = None
-    st.success("Cleared loaded data. Re-upload files when ready.")
-    st.stop()
-
-@st.cache_data(show_spinner=False)
-def load_all(fci_upl, ice_upl, osc_upl):
-    try:
-        fci_df = norm(pd.read_csv(fci_upl, sep="|", engine="python", dtype=str, na_filter=False))
-    except Exception as e:
-        raise RuntimeError(f"Could not read FCI CSV. Is it pipe-delimited (|)?\n\nDetails: {e}")
-
-    try:
-        ice_df = norm(pd.read_excel(ice_upl, sheet_name="Detail2", skiprows=2, dtype=str))
-    except Exception as e:
-        raise RuntimeError(
-            "Could not read ICE workbook.\n"
-            "Expected sheet: 'Detail2' with header row starting at Excel row 3.\n\n"
-            f"Details: {e}"
-        )
-
-    try:
-        osc_df = norm(pd.read_excel(osc_upl, sheet_name="COREVEST", dtype=str))
-    except Exception as e:
-        raise RuntimeError(
-            "Could not read OSC workbook.\n"
-            "Expected sheet: 'COREVEST'.\n\n"
-            f"Details: {e}"
-        )
-
-    return {"fci": fci_df, "ice": ice_df, "osc": osc_df}
-
-if load_clicked:
-    if not all([fci_file, ice_file, osc_file]):
-        st.sidebar.error("Please upload FCI + ICE + OSC before clicking Load.")
-    else:
-        try:
-            st.session_state.data = load_all(fci_file, ice_file, osc_file)
-            st.sidebar.success("Files loaded. You can now generate HUDs.")
-        except Exception as e:
-            st.sidebar.error(str(e))
-
-if st.session_state.data is None:
-    st.info("Upload all 3 files in the sidebar, then click **Load / Reload**.")
-    st.stop()
-
-# Pull dfs
-fci = st.session_state.data["fci"]
-ice = st.session_state.data["ice"]
-osc = st.session_state.data["osc"]
-
-# Basic expectations
-require_cols(fci, ["account"], "FCI")
-require_cols(osc, ["account_number", "primary_status"], "OSC")
-
-# =========================
-# SALESFORCE QUERIES (deal -> opp -> property/advance/account)
-# =========================
-def sf_query_all(soql: str) -> list[dict]:
-    return sf.query_all(soql).get("records", [])
-
-def pick_first(records: list[dict]) -> dict | None:
-    if not records:
-        return None
-    r = records[0].copy()
-    r.pop("attributes", None)
-    return r
-
-def sf_find_opportunity_by_deal_number(deal_number: str) -> dict | None:
-    dn = deal_number.strip()
-    # Try exact match on Deal_Loan_Number__c, else Name contains, else Id exact-ish (rare)
-    soql = f"""
-    SELECT Id, Name, AccountId, Deal_Loan_Number__c
-    FROM Opportunity
-    WHERE Deal_Loan_Number__c = {soql_quote(dn)}
-       OR Name LIKE {soql_quote('%' + dn + '%')}
-    ORDER BY LastModifiedDate DESC
-    LIMIT 10
-    """.strip()
-    rows = sf_query_all(soql)
-    # prefer exact Deal_Loan_Number__c match
-    for r in rows:
-        if str(r.get("Deal_Loan_Number__c","")).strip() == dn:
-            r.pop("attributes", None)
-            return r
-    return pick_first(rows)
-
-def sf_find_property_for_deal(opp_id: str) -> dict | None:
-    soql = f"""
-    SELECT
-      Id,
-      Deal__c,
-      Borrower_Name__c,
-      Full_Address__c,
-      Yardi_Id__c,
-      Servicer_Id__c,
-      Initial_Disbursement_Used__c,
-      Renovation_Advance_Amount_Used__c,
-      Interest_Allocation__c,
-      Holdback_To_Rehab_Ratio__c,
-      Next_Payment_Date__c,
-      Late_Fees_Servicer__c
+    soql_base = """
+    SELECT Id, Name,
+           Yardi_Id__c, Servicer_Id__c,
+           Borrower_Name__c, Full_Address__c,
+           Initial_Disbursement_Used__c,
+           Renovation_Advance_Amount_Used__c,
+           Interest_Allocation__c,
+           Holdback_To_Rehab_Ratio__c,
+           Late_Fees_Servicer__c,
+           Next_Payment_Date__c,
+           Loan__c,
+           Opportunity__c,
+           Account__c
     FROM Property__c
-    WHERE Deal__c = {soql_quote(opp_id)}
-    ORDER BY LastModifiedDate DESC
-    LIMIT 20
-    """.strip()
-    rows = sf_query_all(soql)
-    # If multiple, take the most recently modified (already ordered)
-    return pick_first(rows)
+    """
 
-def sf_find_advances_for_deal(opp_id: str) -> list[dict]:
-    soql = f"""
-    SELECT Id, Deal__c, LOC_Commitment__c, Status__c, LoanDocumentStatus__c, CreatedDate
-    FROM Advance__c
-    WHERE Deal__c = {soql_quote(opp_id)}
-    ORDER BY CreatedDate DESC
-    LIMIT 200
-    """.strip()
-    rows = sf_query_all(soql)
-    for r in rows:
-        r.pop("attributes", None)
-    return rows
+    rec = sf_one(sf, f"{soql_base} WHERE Yardi_Id__c = {soql_quote(q)} LIMIT 1")
+    if rec:
+        return rec
 
-def sf_get_account(account_id: str) -> dict | None:
+    rec = sf_one(sf, f"{soql_base} WHERE Servicer_Id__c = {soql_quote(q)} LIMIT 1")
+    if rec:
+        return rec
+
+    like = "%" + q.replace("%", "\\%") + "%"
+    rec = sf_one(sf, f"{soql_base} WHERE Yardi_Id__c LIKE {soql_quote(like)} LIMIT 1")
+    return rec
+
+def find_loan(sf, loan_id: str) -> dict | None:
+    if not loan_id:
+        return None
     soql = f"""
-    SELECT Id, Name, Yardi_Vendor_Code__c
-    FROM Account
-    WHERE Id = {soql_quote(account_id)}
+    SELECT Id, Name,
+           Servicer_Loan_Id__c,
+           Servicer_Loan_Status__c,
+           Next_Payment_Date__c
+    FROM Loan__c
+    WHERE Id = {soql_quote(loan_id)}
     LIMIT 1
     """.strip()
-    return pick_first(sf_query_all(soql))
+    return sf_one(sf, soql)
 
-def sf_best_total_loan_amount_from_advances(adv_rows: list[dict]) -> float:
-    # You mapped "Loan Commitment" -> Advance__c.LOC_Commitment__c
-    vals = []
-    for r in adv_rows or []:
-        v = r.get("LOC_Commitment__c")
-        if v is None or str(v).strip() == "":
+def find_opportunity(sf, opp_id: str) -> dict | None:
+    if not opp_id:
+        return None
+    soql = f"""
+    SELECT Id, Name,
+           Next_Payment_Date__c,
+           Late_Fees_Servicer__c
+    FROM Opportunity
+    WHERE Id = {soql_quote(opp_id)}
+    LIMIT 1
+    """.strip()
+    return sf_one(sf, soql)
+
+def find_account(sf, acct_id: str) -> dict | None:
+    if not acct_id:
+        return None
+    soql = f"""
+    SELECT Id, Name,
+           Yardi_Vendor_Code__c
+    FROM Account
+    WHERE Id = {soql_quote(acct_id)}
+    LIMIT 1
+    """.strip()
+    return sf_one(sf, soql)
+
+def find_commitment_from_advance(sf, property_rec: dict) -> float:
+    # Try common relationship fields; adjust if your org uses a different link.
+    prop_id = property_rec.get("Id")
+    opp_id = property_rec.get("Opportunity__c")
+
+    candidates = [
+        ("Property__c", prop_id),
+        ("Opportunity__c", opp_id),
+        ("Deal__c", opp_id),
+    ]
+    for field, val in candidates:
+        if not val:
             continue
-        try:
-            vals.append(float(v))
-        except Exception:
-            pass
-    return float(max(vals)) if vals else 0.0
+        soql = f"""
+        SELECT Id, Name, LOC_Commitment__c
+        FROM Advance__c
+        WHERE {field} = {soql_quote(val)}
+        ORDER BY CreatedDate DESC
+        LIMIT 1
+        """.strip()
+        rec = sf_one(sf, soql)
+        if rec and rec.get("LOC_Commitment__c") is not None:
+            return float(rec.get("LOC_Commitment__c") or 0.0)
+    return 0.0
 
 # =========================
-# MAIN UI
+# LOAD OSC + CAF FROM REPO
 # =========================
+@st.cache_data(show_spinner=False)
+def load_osc(path: Path) -> pd.DataFrame:
+    df = pd.read_excel(path, sheet_name="COREVEST", dtype=str)
+    return norm(df)
+
+@st.cache_data(show_spinner=False)
+def load_caf(path: Path) -> pd.DataFrame:
+    df = pd.read_excel(path, sheet_name=0, dtype=str)
+    return norm(df)
+
+# =========================
+# APP
+# =========================
+st.title("🏗️ HUD Generator")
+st.caption("Salesforce-only deal data (no Hayden/FCI). OSC + CAF loaded from repo.")
+
+sf_secret = get_sf_secrets()
+client_id = sf_secret["client_id"]
+client_secret = sf_secret["client_secret"]
+auth_host = sf_secret["auth_host"].rstrip("/")
+redirect_uri = sf_secret["redirect_uri"].strip()
+api_version = str(sf_secret.get("api_version", "59.0"))
+
+# Read OAuth callback params
+params = st.query_params
+code = params.get("code", None)
+state = params.get("state", None)
+
+# Login section
+if "sf_token" not in st.session_state:
+    st.session_state.sf_token = None
+
+if st.session_state.sf_token is None:
+    oauth_login_button(auth_host, client_id, redirect_uri)
+
+    if code:
+        # verify state
+        if not st.session_state.get("oauth_state") or state != st.session_state.oauth_state:
+            st.error("OAuth state mismatch. Click Login again.")
+            st.stop()
+
+        try:
+            tok = exchange_code_for_token(
+                auth_host=auth_host,
+                client_id=client_id,
+                client_secret=client_secret,
+                redirect_uri=redirect_uri,
+                code=code,
+                code_verifier=st.session_state.pkce_verifier,
+            )
+            st.session_state.sf_token = tok
+            # Clear query params so refresh doesn't re-exchange
+            st.query_params.clear()
+            st.success("Salesforce connected ✅")
+        except Exception as e:
+            st.error(f"Token exchange failed: {e}")
+            st.stop()
+    else:
+        st.stop()
+
+tok = st.session_state.sf_token
+access_token = tok.get("access_token", "")
+instance_url = tok.get("instance_url", "") or auth_host
+if not access_token:
+    st.error("Missing access_token after OAuth.")
+    st.stop()
+
+sf = sf_from_token(instance_url, access_token, api_version=api_version)
+
+# Load OSC/CAF from repo
+osc_df = None
+caf_df = None
+if DEFAULT_OSC_PATH.exists():
+    osc_df = load_osc(DEFAULT_OSC_PATH)
+    require_cols(osc_df, ["account_number", "primary_status"], "OSC ZStatus")
+else:
+    st.warning(f"OSC file not found in repo: {DEFAULT_OSC_PATH}")
+
+if DEFAULT_CAF_PATH.exists():
+    caf_df = load_caf(DEFAULT_CAF_PATH)
+else:
+    st.warning(f"CAF file not found in repo: {DEFAULT_CAF_PATH}")
+
+# Tabs
 tab_inputs, tab_results = st.tabs(["🧾 Inputs", "📄 Results / Export"])
 
 with tab_inputs:
-    st.subheader("Deal Inputs")
-
     with st.form("inputs_form"):
-        deal_number = st.text_input("Deal Number", placeholder="58439")
+        deal_key = st.text_input("Deal Identifier (Yardi ID or Servicer ID)", placeholder="e.g., 52874 or Servicer ID")
         advance_amount = st.number_input("Advance Amount", min_value=0.0, step=0.01, format="%.2f")
 
         c1, c2, c3 = st.columns(3)
-        holdback_current_raw = c1.text_input("Holdback % Current (optional override)", placeholder="(leave blank to use Salesforce)")
+        holdback_current_raw = c1.text_input("Holdback % Current (optional override)", placeholder="leave blank to use Salesforce ratio")
         holdback_closing_raw = c2.text_input("Holdback % at Closing", placeholder="100")
         advance_date_raw = c3.text_input("Advance Date", placeholder="MM/DD/YYYY")
 
@@ -545,178 +565,112 @@ with tab_inputs:
         construction_mgmt_fee = f3.number_input("Construction Management Fee", min_value=0.0, step=0.01, format="%.2f")
         title_fee = f4.number_input("Title Fee", min_value=0.0, step=0.01, format="%.2f")
 
-        include_late_charges = st.checkbox("Include FCI accrued late charges as a HUD line item", value=False)
+        include_late_charges = st.checkbox("Include Salesforce 'Late Fees Servicer' as HUD line item", value=False)
 
         submitted = st.form_submit_button("Generate HUD ✅")
 
     if not submitted:
         st.stop()
 
-    deal_number = str(deal_number).strip()
-    if deal_number == "":
-        st.error("Deal Number is required.")
+    deal_key = str(deal_key).strip()
+    if not deal_key:
+        st.error("Deal Identifier required.")
         st.stop()
 
-    # --- Salesforce: find deal
-    opp = sf_find_opportunity_by_deal_number(deal_number)
-    if not opp:
-        st.error("Deal Number not found in Salesforce Opportunity (Deal_Loan_Number__c or Name contains).")
+    prop = find_property_by_input(sf, deal_key)
+    if not prop:
+        st.error("No matching Property__c found using Yardi_Id__c or Servicer_Id__c.")
         st.stop()
 
-    opp_id = opp["Id"]
-    account_id = opp.get("AccountId")
+    deal_number_display = prop.get("Yardi_Id__c") or deal_key
+    servicer_id = (prop.get("Servicer_Id__c") or "").strip()
 
-    prop = sf_find_property_for_deal(opp_id)
-    advs = sf_find_advances_for_deal(opp_id)
-    acct = sf_get_account(account_id) if account_id else None
+    loan = find_loan(sf, prop.get("Loan__c")) if prop.get("Loan__c") else None
+    opp = find_opportunity(sf, prop.get("Opportunity__c")) if prop.get("Opportunity__c") else None
+    acct = find_account(sf, prop.get("Account__c")) if prop.get("Account__c") else None
 
-    # --- Pull SF values (best effort)
-    sf_total_loan_amount = sf_best_total_loan_amount_from_advances(advs)
+    total_loan_amount = find_commitment_from_advance(sf, prop)
+    initial_advance = float(prop.get("Initial_Disbursement_Used__c") or 0.0)
+    total_reno_drawn = float(prop.get("Renovation_Advance_Amount_Used__c") or 0.0)
+    interest_reserve = float(prop.get("Interest_Allocation__c") or 0.0)
 
-    sf_initial_advance = parse_money(prop.get("Initial_Disbursement_Used__c")) if prop else 0.0
-    sf_total_reno = parse_money(prop.get("Renovation_Advance_Amount_Used__c")) if prop else 0.0
-    sf_interest_reserve = parse_money(prop.get("Interest_Allocation__c")) if prop else 0.0
+    borrower_name = (prop.get("Borrower_Name__c") or "").strip().upper()
+    address_full = (prop.get("Full_Address__c") or "").strip().upper()
 
-    sf_borrower = (prop.get("Borrower_Name__c") if prop else "") or ""
-    sf_address = (prop.get("Full_Address__c") if prop else "") or ""
-    sf_yardi_id = (prop.get("Yardi_Id__c") if prop else "") or ""
+    sf_holdback_current = ratio_to_pct_str(prop.get("Holdback_To_Rehab_Ratio__c"))
+    holdback_current = normalize_pct(holdback_current_raw) if holdback_current_raw.strip() else sf_holdback_current
+    holdback_closing = normalize_pct(holdback_closing_raw)
 
-    # Servicer ID (for FCI/OSC matching)
-    # Primary: Property__c.Servicer_Id__c
-    # Fallbacks shown to user: Yardi_Id__c, deal_number itself
-    servicer_candidates = []
-    if prop and prop.get("Servicer_Id__c"):
-        servicer_candidates.append(str(prop.get("Servicer_Id__c")).strip())
-    if prop and prop.get("Yardi_Id__c"):
-        servicer_candidates.append(str(prop.get("Yardi_Id__c")).strip())
-    if opp.get("Deal_Loan_Number__c"):
-        servicer_candidates.append(str(opp.get("Deal_Loan_Number__c")).strip())
-    servicer_candidates.append(deal_number.strip())
+    late_fees_prop = prop.get("Late_Fees_Servicer__c")
+    late_fees_opp = opp.get("Late_Fees_Servicer__c") if opp else None
+    late_fees_amt = float(late_fees_prop or late_fees_opp or 0.0)
 
-    # de-dupe while preserving order
-    seen = set()
-    servicer_candidates = [x for x in servicer_candidates if x and (x not in seen and not seen.add(x))]
+    next_payment = None
+    if loan and loan.get("Next_Payment_Date__c"):
+        next_payment = loan.get("Next_Payment_Date__c")
+    elif opp and opp.get("Next_Payment_Date__c"):
+        next_payment = opp.get("Next_Payment_Date__c")
+    elif prop.get("Next_Payment_Date__c"):
+        next_payment = prop.get("Next_Payment_Date__c")
+    next_payment_disp = parse_date_to_mmddyyyy(next_payment) if next_payment else ""
 
-    # Holdback current (prefer SF unless user overrides)
-    sf_holdback_current = ratio_to_pct_display(prop.get("Holdback_To_Rehab_Ratio__c")) if prop else ""
-    hb_current_final = normalize_pct(holdback_current_raw) if str(holdback_current_raw).strip() else sf_holdback_current
-    hb_closing_final = normalize_pct(holdback_closing_raw)
+    servicer_loan_status = (loan.get("Servicer_Loan_Status__c") if loan else "") or ""
+    servicer_loan_id = (loan.get("Servicer_Loan_Id__c") if loan else "") or ""
+    workday_sup_code = (acct.get("Yardi_Vendor_Code__c") if acct else "") or ""
 
-    # Yardi Vendor Code (Account)
-    yardi_vendor_code = (acct.get("Yardi_Vendor_Code__c") if acct else "") or ""
+    # OSC check + address fallback
+    primary_status = ""
+    if osc_df is not None and servicer_id:
+        osc_match = osc_df[osc_df["account_number"].astype(str).str.strip() == servicer_id]
+        if not osc_match.empty:
+            primary_status = safe_first(osc_match, "primary_status", "")
+            if primary_status != "Outside Policy In-Force":
+                st.error("🚨 OSC Primary Status is NOT Outside Policy In-Force — reach out to the borrower.")
+                st.stop()
+            if not address_full:
+                street = str(safe_first(osc_match, "property_street", "")).strip()
+                city   = str(safe_first(osc_match, "property_city", "")).strip()
+                state  = str(safe_first(osc_match, "property_state", "")).strip()
+                zipc   = str(safe_first(osc_match, "property_zip", "")).strip()
+                address_full = " ".join([p for p in [street, city, state, zipc] if p]).strip().upper()
 
-    # Workday SUP Code (still unknown; placeholder)
-    workday_sup_code = ""  # <- once you find the field, set from SF here
-
-    # --- Find matching FCI row by trying candidates
-    fci_match = pd.DataFrame()
-    used_servicer_id = ""
-    for cand in servicer_candidates:
-        hit = fci[fci["account"].astype(str).str.strip() == str(cand).strip()]
-        if not hit.empty:
-            fci_match = hit
-            used_servicer_id = str(cand).strip()
-            break
-
-    if fci_match.empty:
-        st.error(
-            "No matching FCI record found.\n\n"
-            f"Tried these Servicer ID candidates:\n- " + "\n- ".join(servicer_candidates)
-        )
-        st.stop()
-
-    next_payment_due = safe_first(fci_match, "nextpaymentdue", "")
-    accrued_late_charges_raw = safe_first(fci_match, "accruedlatecharges", "")
-    status_enum = safe_first(fci_match, "statusenum", "")
-    property_street = safe_first(fci_match, "propertystreet", "")
-    accrued_late_charges_amt = parse_money(accrued_late_charges_raw)
-
-    # --- OSC match + policy check (by used_servicer_id)
-    osc_match = osc[osc["account_number"].astype(str).str.strip() == used_servicer_id]
-    if osc_match.empty:
-        st.error(f"No OSC record found for Servicer ID (Account Number): {used_servicer_id}")
-        st.stop()
-
-    primary_status = safe_first(osc_match, "primary_status", "")
-    if primary_status != "Outside Policy In-Force":
-        st.error("🚨 OSC Primary Status is NOT Outside Policy In-Force — reach out to the borrower.")
-        st.stop()
-
-    # Address fallback: if SF address blank, build from OSC
-    street = str(safe_first(osc_match, "property_street", "")).strip()
-    city = str(safe_first(osc_match, "property_city", "")).strip()
-    state = str(safe_first(osc_match, "property_state", "")).strip()
-    zipc = str(safe_first(osc_match, "property_zip", "")).strip()
-    osc_address_disp = " ".join([p for p in [street, city, state, zipc] if p]).strip().upper()
-
-    address_disp = (str(sf_address).strip() or osc_address_disp).upper()
-
-    # ICE optional check (best-effort match)
-    ice_addr_col = first_present_col(ice, ["property_address", "propertyaddress", "address", "site_address"])
-    ice_status = {}
-    if ice_addr_col and str(property_street).strip():
-        addr = str(property_street).lower().strip()
-        ice_addr = ice[ice_addr_col].astype(str).str.lower().str.strip()
-        ice_match = ice[ice_addr.str.contains(re.escape(addr), na=False)]
-        if not ice_match.empty:
-            for col in ["inst_1_payment_status", "inst_2_payment_status", "inst_3_payment_status"]:
-                if col in ice_match.columns:
-                    ice_status[col] = ice_match[col].iloc[0]
-
-    # --- Build ctx using Salesforce instead of Hayden
+    # ctx
     ctx = {
-        "deal_number": deal_number,
-        "servicer_id": used_servicer_id,
+        "deal_number": deal_number_display,
+        "servicer_id": servicer_id,
 
-        "total_loan_amount": float(sf_total_loan_amount),
-        "initial_advance": float(sf_initial_advance),
-        "total_reno_drawn": float(sf_total_reno),
-        "interest_reserve": float(sf_interest_reserve),
+        "total_loan_amount": float(total_loan_amount),
+        "initial_advance": float(initial_advance),
+        "total_reno_drawn": float(total_reno_drawn),
+        "interest_reserve": float(interest_reserve),
 
         "advance_amount": float(advance_amount),
 
-        "holdback_current": hb_current_final,
-        "holdback_closing": hb_closing_final,
+        "holdback_current": holdback_current,
+        "holdback_closing": holdback_closing,
         "advance_date": parse_date_to_mmddyyyy(advance_date_raw),
 
         "workday_sup_code": str(workday_sup_code).strip(),
-        "borrower_disp": str(sf_borrower).strip().upper(),
-        "address_disp": address_disp,
+        "borrower_disp": borrower_name,
+        "address_disp": address_full,
 
         "inspection_fee": float(inspection_fee),
         "wire_fee": float(wire_fee),
         "construction_mgmt_fee": float(construction_mgmt_fee),
         "title_fee": float(title_fee),
 
-        # Late charges (display always; include in HUD optionally)
-        "accrued_late_charges_raw": str(accrued_late_charges_raw),
-        "accrued_late_charges_amt": float(accrued_late_charges_amt),
+        "accrued_late_charges_amt": float(late_fees_amt),
         "include_late_charges": bool(include_late_charges),
-
-        # Extra SF context (for visibility/debug)
-        "yardi_id": str(sf_yardi_id).strip(),
-        "yardi_vendor_code": str(yardi_vendor_code).strip(),
     }
-
     ctx = recompute(ctx)
 
-    # Save snapshot
     st.session_state["last_ctx"] = ctx
     st.session_state["last_snapshot"] = {
-        "sf_opportunity_id": opp_id,
-        "sf_account_id": account_id or "",
-        "sf_property_id": (prop.get("Id") if prop else "") or "",
-        "sf_advances_count": len(advs or []),
-        "sf_total_loan_amount_source": "Advance__c.LOC_Commitment__c (max)",
-        "sf_holdback_current_source": "Property__c.Holdback_To_Rehab_Ratio__c (ratio)" if not str(holdback_current_raw).strip() else "Manual override",
-        "yardi_id": ctx.get("yardi_id", ""),
-        "yardi_vendor_code": ctx.get("yardi_vendor_code", ""),
         "primary_status": primary_status,
-        "next_payment_due": next_payment_due,
-        "status_enum": status_enum,
-        "accrued_late_charges_raw": accrued_late_charges_raw,
-        "ice_status": ice_status,
-        "servicer_candidates_tried": servicer_candidates,
+        "next_payment_due": next_payment_disp,
+        "status_enum": servicer_loan_status,
+        "late_fees_amt": late_fees_amt,
+        "servicer_loan_id": servicer_loan_id,
     }
 
 with tab_results:
@@ -730,113 +684,23 @@ with tab_results:
     st.subheader("Validation Snapshot")
     a, b, c, d = st.columns(4)
     a.metric("Deal", ctx.get("deal_number", ""))
-    b.metric("Servicer ID (used)", ctx.get("servicer_id", ""))
-    c.metric("OSC Primary Status", snap.get("primary_status", ""))
-    d.metric("Yardi Vendor Code", snap.get("yardi_vendor_code", "") or "—")
+    b.metric("Servicer ID", ctx.get("servicer_id", ""))
+    c.metric("Next Payment Due", snap.get("next_payment_due", ""))
+    d.metric("Servicer Loan Status", snap.get("status_enum", ""))
 
     e, f, g = st.columns(3)
-    e.metric("FCI Next Payment Due", snap.get("next_payment_due", ""))
-    f.metric("FCI Status Enum", snap.get("status_enum", ""))
-    fci_lates_disp = snap.get("accrued_late_charges_raw", "")
-    g.metric("FCI Accrued Late Charges", fci_lates_disp if fci_lates_disp else "0")
-
-    with st.expander("Salesforce debug (what was pulled)"):
-        st.json({
-            "OpportunityId": snap.get("sf_opportunity_id", ""),
-            "AccountId": snap.get("sf_account_id", ""),
-            "PropertyId": snap.get("sf_property_id", ""),
-            "AdvancesCount": snap.get("sf_advances_count", 0),
-            "TotalLoanAmountSource": snap.get("sf_total_loan_amount_source", ""),
-            "HoldbackCurrentSource": snap.get("sf_holdback_current_source", ""),
-            "ServicerCandidatesTried": snap.get("servicer_candidates_tried", []),
-            "YardiId": snap.get("yardi_id", ""),
-            "YardiVendorCode": snap.get("yardi_vendor_code", ""),
-        })
-
-    if snap.get("ice_status"):
-        with st.expander("ICE Installment Status (best-effort match)"):
-            st.json(snap["ice_status"])
+    e.metric("Servicer Loan ID", snap.get("servicer_loan_id", ""))
+    f.metric("Late Fees (SF)", fmt_money(snap.get("late_fees_amt", 0.0)))
+    g.metric("OSC Primary Status", snap.get("primary_status", "") or "N/A")
 
     st.divider()
-
     st.subheader("HUD Preview")
-    hud_html = render_hud_html(ctx)
-    st.markdown(hud_html, unsafe_allow_html=True)
+    st.markdown(render_hud_html(ctx), unsafe_allow_html=True)
 
     st.divider()
-
-    st.subheader("Edit After Preview (updates HUD)")
-    st.caption("Edit values below, click **Apply Edits**, then re-download the HTML.")
-
-    editable_rows = [
-        ("Total Loan Amount", ctx["total_loan_amount"], "money"),
-        ("Initial Advance", ctx["initial_advance"], "money"),
-        ("Total Reno Drawn", ctx["total_reno_drawn"], "money"),
-        ("Advance Amount", ctx["advance_amount"], "money"),
-        ("Interest Reserve", ctx["interest_reserve"], "money"),
-        ("Holdback % Current", ctx.get("holdback_current", ""), "text"),
-        ("Holdback % at Closing", ctx.get("holdback_closing", ""), "text"),
-        ("Advance Date", ctx.get("advance_date", ""), "text"),
-        ("Workday SUP Code", ctx.get("workday_sup_code", ""), "text"),
-        ("Borrower", ctx.get("borrower_disp", ""), "text"),
-        ("Address", ctx.get("address_disp", ""), "text"),
-        ("3rd party Inspection Fee", ctx["inspection_fee"], "money"),
-        ("Wire Fee", ctx["wire_fee"], "money"),
-        ("Construction Management Fee", ctx["construction_mgmt_fee"], "money"),
-        ("Title Fee", ctx["title_fee"], "money"),
-        ("Include Late Charges Line Item", bool(ctx.get("include_late_charges", False)), "bool"),
-    ]
-    editor_df = pd.DataFrame(editable_rows, columns=["Field", "Value", "Type"])
-
-    edited = st.data_editor(
-        editor_df,
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Field": st.column_config.TextColumn(disabled=True),
-            "Type": st.column_config.TextColumn(disabled=True),
-        },
-        key="hud_editor",
-    )
-
-    if st.button("Apply Edits ✅"):
-        by_field = dict(zip(edited["Field"], edited["Value"]))
-
-        ctx["total_loan_amount"] = parse_money(by_field.get("Total Loan Amount"))
-        ctx["initial_advance"] = parse_money(by_field.get("Initial Advance"))
-        ctx["total_reno_drawn"] = parse_money(by_field.get("Total Reno Drawn"))
-        ctx["advance_amount"] = float(parse_money(by_field.get("Advance Amount")))
-        ctx["interest_reserve"] = parse_money(by_field.get("Interest Reserve"))
-
-        ctx["holdback_current"] = normalize_pct(by_field.get("Holdback % Current"))
-        ctx["holdback_closing"] = normalize_pct(by_field.get("Holdback % at Closing"))
-        ctx["advance_date"] = parse_date_to_mmddyyyy(by_field.get("Advance Date"))
-
-        ctx["workday_sup_code"] = str(by_field.get("Workday SUP Code", "")).strip()
-        ctx["borrower_disp"] = str(by_field.get("Borrower", "")).strip().upper()
-        ctx["address_disp"] = str(by_field.get("Address", "")).strip().upper()
-
-        ctx["inspection_fee"] = float(parse_money(by_field.get("3rd party Inspection Fee")))
-        ctx["wire_fee"] = float(parse_money(by_field.get("Wire Fee")))
-        ctx["construction_mgmt_fee"] = float(parse_money(by_field.get("Construction Management Fee")))
-        ctx["title_fee"] = float(parse_money(by_field.get("Title Fee")))
-
-        include_flag = by_field.get("Include Late Charges Line Item", False)
-        ctx["include_late_charges"] = bool(include_flag)
-
-        ctx = recompute(ctx)
-        st.session_state["last_ctx"] = ctx
-
-        st.success("Edits applied.")
-        st.markdown(render_hud_html(ctx), unsafe_allow_html=True)
-
-    st.divider()
-
     st.download_button(
         "⬇️ Download HUD as HTML",
         data=render_hud_html(ctx),
         file_name=f"HUD_{ctx.get('deal_number','')}.html",
         mime="text/html",
     )
-
-    st.caption("You can run another deal from the Inputs tab without re-uploading files.")
