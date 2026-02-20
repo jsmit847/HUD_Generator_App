@@ -1,13 +1,11 @@
 # ============================================================
-# HUD GENERATOR — ONE-CELL DROP-IN (NON-TECH FRIENDLY)
-# Flow:
-# 1) Login to Salesforce
-# 2) Enter Deal Number -> run PRE-CHECKS (shows plain-English results)
-# 3) Only if checks pass -> show HUD inputs
-# Notes:
-# - Precheck table shows: Check | Result | Details | What to do
-# - No "object/field" shown to users
-# - Money inputs are TEXT fields that accept $ / commas / parentheses and DISPLAY formatted ($#,###.##)
+# HUD GENERATOR — ONE-CELL DROP-IN (FIXED session_state BUG)
+# Fixes:
+# - NO writes to st.session_state for widget keys after instantiation
+# - Removed "Prefilled from Salesforce" wording (just fills values)
+# - Late Fees check: "✅ Clear" is a GOOD thing (still blocks if > 0)
+# - Removed "What to do" column
+# - Prechecks run BEFORE fees/inputs
 # ============================================================
 
 import re
@@ -91,20 +89,23 @@ def parse_date_to_mmddyyyy(s: str) -> str:
     except Exception:
         return ""
 
+def _ensure_default(key: str, default_value: str):
+    # Only set a default BEFORE the widget is instantiated
+    if key not in st.session_state:
+        st.session_state[key] = default_value
+
 def money_text_input(label: str, key: str, default_float: float = 0.0, help_text: str | None = None) -> float:
     """
     Non-tech-friendly money entry:
     - User types: 1234.5 or $1,234.50 or (123.45)
-    - We show formatted value right below after parsing
+    - We display formatted value after parsing
+    IMPORTANT: we DO NOT assign to st.session_state[key] after widget creation
     """
-    if key not in st.session_state:
-        st.session_state[key] = fmt_money(default_float)
-
-    raw = st.text_input(label, key=key, value=st.session_state[key], help=help_text)
+    _ensure_default(key, fmt_money(default_float))
+    raw = st.text_input(label, key=key, help=help_text)
     try:
         val = parse_money(raw)
         st.caption(f"Formatted: **{fmt_money(val)}**")
-        st.session_state[key] = fmt_money(val)  # normalize stored display
         return float(val)
     except Exception as e:
         st.error(str(e))
@@ -112,13 +113,12 @@ def money_text_input(label: str, key: str, default_float: float = 0.0, help_text
 
 # =========================================================
 # Salesforce OAuth (PKCE) — minimal
-# IMPORTANT: redirect_uri MUST match Salesforce Connected App exactly.
 # =========================================================
 cfg = st.secrets["salesforce"]
 CLIENT_ID = cfg["client_id"]
 AUTH_HOST = cfg.get("auth_host", "https://login.salesforce.com").rstrip("/")
-REDIRECT_URI = cfg["redirect_uri"].rstrip("/")  # normalize
-CLIENT_SECRET = cfg.get("client_secret")  # optional (your org may require)
+REDIRECT_URI = cfg["redirect_uri"].rstrip("/")
+CLIENT_SECRET = cfg.get("client_secret")  # optional
 
 AUTH_URL = f"{AUTH_HOST}/services/oauth2/authorize"
 TOKEN_URL = f"{AUTH_HOST}/services/oauth2/token"
@@ -276,7 +276,6 @@ def find_opportunity_by_deal_number(deal_number: str) -> dict | None:
 
     where_clauses = []
 
-    # if pasted Salesforce Id
     if re.fullmatch(r"[a-zA-Z0-9]{15}([a-zA-Z0-9]{3})?", deal_number):
         where_clauses.append(f"Id = '{deal_number}'")
 
@@ -297,7 +296,6 @@ def find_opportunity_by_deal_number(deal_number: str) -> dict | None:
 
 # =========================================================
 # Related Property / Loan (best-effort)
-# NOTE: if your org uses a different link field, update these lists.
 # =========================================================
 PROPERTY_LINK_FIELDS = ["Opportunity__c", "OpportunityId__c", "Deal__c", "DealId__c"]
 LOAN_LINK_FIELDS = ["Opportunity__c", "OpportunityId__c", "Deal__c", "DealId__c"]
@@ -317,7 +315,6 @@ def fetch_related_property(opp_id: str) -> dict | None:
         "Late_Fees_Servicer__c",
         "Next_Payment_Date__c",
         "Servicer_Id__c",
-        "Yardi_Id__c",
     ]
     fields = _filter_existing("Property__c", desired)
     if "Id" not in fields:
@@ -341,113 +338,92 @@ def fetch_related_loan(opp_id: str) -> dict | None:
     return sf_query_one(soql)
 
 # =========================================================
-# Prechecks (plain English)
-# Matches your “what mattered” idea:
-# - Servicer ID found (we’ll display it if present)
-# - Next Payment Due
-# - Status Enum (Salesforce doesn't have FCI statusenum; we’ll show Servicer Loan Status instead)
-# - Late Fees (as a check)
-# - Insurance Status (as a check)
-# (OSC “Outside Policy In-Force” was from spreadsheet; if you still want it later, we can add a local file lookup.)
+# Prechecks (plain English table)
 # =========================================================
 def run_prechecks(deal_number: str) -> dict:
     checks = []
     blockers = []
 
-    def add(check_name: str, result: str, details: str = "", what_to_do: str = ""):
-        checks.append({
-            "Check": check_name,
-            "Result": result,
-            "Details": details,
-            "What to do": what_to_do
-        })
+    def add(check_name: str, result: str, details: str = ""):
+        checks.append({"Check": check_name, "Result": result, "Details": details})
 
     opp = find_opportunity_by_deal_number(deal_number)
     if not opp:
-        add(
-            "Deal found in Salesforce",
-            "❌ Not found",
-            f"Deal Number {deal_number} was not found.",
-            "Double-check the Deal Number and try again."
-        )
+        add("Deal found", "❌ Not found", f"Deal Number {deal_number} was not found.")
         return {"ok": False, "opp": None, "prop": None, "loan": None, "checks": checks, "blockers": ["Deal not found"]}
 
-    add("Deal found in Salesforce", "✅ Found", f"Deal: {opp.get('Name','')}".strip(), "")
+    add("Deal found", "✅ Found", f"{opp.get('Name','')}".strip())
 
     opp_id = opp.get("Id")
     prop = fetch_related_property(opp_id) if opp_id else None
     loan = fetch_related_loan(opp_id) if opp_id else None
 
-    # Servicer ID (preferred from Property__c.Servicer_Id__c, fallback Loan__c.Servicer_Loan_Id__c)
+    # Servicer ID
     servicer_id = ""
-    if prop and "Servicer_Id__c" in prop and str(prop.get("Servicer_Id__c") or "").strip():
+    if prop and str(prop.get("Servicer_Id__c") or "").strip():
         servicer_id = str(prop.get("Servicer_Id__c")).strip()
-    elif loan and "Servicer_Loan_Id__c" in loan and str(loan.get("Servicer_Loan_Id__c") or "").strip():
+    elif loan and str(loan.get("Servicer_Loan_Id__c") or "").strip():
         servicer_id = str(loan.get("Servicer_Loan_Id__c")).strip()
 
-    add("Servicer ID", "✅ Found" if servicer_id else "⚠️ Missing", servicer_id if servicer_id else "Not available from Salesforce links.", "If missing, confirm the deal’s servicing info in Salesforce.")
+    add("Servicer ID", "✅ Found" if servicer_id else "⚠️ Missing", servicer_id if servicer_id else "Not available.")
 
-    # Next Payment Date (Loan preferred, fallback Property, fallback Opportunity)
+    # Next Payment Date (Loan -> Property -> Opportunity)
     npd = ""
-    if loan and "Next_Payment_Date__c" in loan and loan.get("Next_Payment_Date__c"):
+    if loan and loan.get("Next_Payment_Date__c"):
         npd = str(loan.get("Next_Payment_Date__c"))
-    elif prop and "Next_Payment_Date__c" in prop and prop.get("Next_Payment_Date__c"):
+    elif prop and prop.get("Next_Payment_Date__c"):
         npd = str(prop.get("Next_Payment_Date__c"))
-    elif "Next_Payment_Date__c" in opp and opp.get("Next_Payment_Date__c"):
+    elif opp.get("Next_Payment_Date__c"):
         npd = str(opp.get("Next_Payment_Date__c"))
 
-    add("Next Payment Date", "✅ Found" if npd else "⚠️ Missing", npd if npd else "Blank / not available.", "Confirm Next Payment Date is populated.")
+    add("Next Payment Date", "✅ Found" if npd else "⚠️ Missing", npd if npd else "Blank / not available.")
 
-    # “Status Enum” replacement (Servicer Loan Status)
+    # Servicer Loan Status + foreclosure keyword check
     sls = ""
-    if loan and "Servicer_Loan_Status__c" in loan and loan.get("Servicer_Loan_Status__c"):
+    if loan and loan.get("Servicer_Loan_Status__c"):
         sls = str(loan.get("Servicer_Loan_Status__c")).strip()
 
-    if sls:
-        add("Servicer Loan Status", "✅ Found", sls, "")
-        if any(x in sls.lower() for x in ["foreclosure", "foreclose"]):
-            blockers.append("Foreclosure status")
-            add("Foreclosure Check", "❌ Flagged", "Loan status suggests foreclosure.", "Confirm with servicing / management before proceeding.")
-        else:
-            add("Foreclosure Check", "✅ Clear", "No foreclosure keywords detected.", "")
+    add("Servicer Loan Status", "✅ Found" if sls else "⚠️ Missing", sls if sls else "Not available.")
+    if sls and any(x in sls.lower() for x in ["foreclosure", "foreclose"]):
+        blockers.append("Foreclosure")
+        add("Foreclosure check", "❌ Flagged", "Foreclosure keyword detected in loan status.")
+    elif sls:
+        add("Foreclosure check", "✅ Clear", "No foreclosure keywords detected.")
     else:
-        add("Servicer Loan Status", "⚠️ Missing", "Not available.", "Confirm Servicer Loan Status is populated in Salesforce.")
-        add("Foreclosure Check", "⚠️ Not run", "Missing Servicer Loan Status.", "Populate Servicer Loan Status and rerun checks.")
+        add("Foreclosure check", "⚠️ Not run", "Servicer Loan Status missing.")
 
     # Insurance status (Property__c)
     ins = ""
-    if prop and "Insurance_Status__c" in prop and prop.get("Insurance_Status__c"):
+    if prop and prop.get("Insurance_Status__c"):
         ins = str(prop.get("Insurance_Status__c")).strip()
-    if ins:
-        add("Insurance Status", "✅ Found", ins, "")
-    else:
-        add("Insurance Status", "⚠️ Missing", "Blank / not available.", "Confirm Insurance Status is populated before HUD.")
+    add("Insurance status", "✅ Found" if ins else "⚠️ Missing", ins if ins else "Blank / not available.")
 
     # Late fees (Property preferred, else Opportunity)
-    late = None
+    late_field_present = ("Late_Fees_Servicer__c" in (prop or {})) or ("Late_Fees_Servicer__c" in (opp or {}))
+    late_raw = None
     if prop and "Late_Fees_Servicer__c" in prop:
-        late = prop.get("Late_Fees_Servicer__c")
+        late_raw = prop.get("Late_Fees_Servicer__c")
     elif "Late_Fees_Servicer__c" in opp:
-        late = opp.get("Late_Fees_Servicer__c")
+        late_raw = opp.get("Late_Fees_Servicer__c")
 
-    late_amt = parse_money(late) if late not in (None, "") else 0.0
-    if late is None:
-        add("Late Fees Check", "⚠️ Not available", "Late fee field not available via current Salesforce links.", "Confirm late fees in Salesforce before HUD.")
+    if not late_field_present:
+        add("Late fees", "⚠️ Not available", "Late fee field not available via current links.")
     else:
+        late_amt = parse_money(late_raw) if late_raw not in (None, "") else 0.0
         if late_amt > 0:
             blockers.append("Late fees")
-            add("Late Fees Check", "❌ Flagged", f"Late Fees: {fmt_money(late_amt)}", "Resolve/confirm late fees before proceeding.")
+            add("Late fees", "❌ Flagged", f"{fmt_money(late_amt)}")
         else:
-            add("Late Fees Check", "✅ Clear", "Late Fees: $0.00", "")
+            add("Late fees", "✅ Clear", "$0.00")
 
     ok = (len(blockers) == 0)
     return {"ok": ok, "opp": opp, "prop": prop, "loan": loan, "checks": checks, "blockers": blockers, "servicer_id": servicer_id}
 
 # =========================================================
-# UI — Step 1: Deal Number -> run checks
+# UI — Deal Number -> run checks
 # =========================================================
 st.divider()
-st.subheader("Step 1 — Enter Deal Number")
+st.subheader("Step 1 — Deal Number")
 
 with st.form("deal_form"):
     deal_number = st.text_input("Deal Number", placeholder="Example: 52874")
@@ -463,20 +439,19 @@ if not deal_number:
 
 result = run_prechecks(deal_number)
 
-st.subheader("Checks & Results")
+st.subheader("Checks")
 checks_df = pd.DataFrame(result["checks"])
 st.dataframe(checks_df, use_container_width=True, hide_index=True)
 
 if not result["ok"]:
     st.error("❌ This deal needs attention before a HUD can be started.")
-    st.info("Fix/confirm the items marked ❌ or ⚠️, then rerun checks.")
     st.stop()
 
-st.success("✅ All checks passed — you can now enter fees and HUD inputs.")
+st.success("✅ All checks passed — continue below.")
 
 # =========================================================
-# Step 2: HUD Inputs (money shows as $ with commas)
-# For now: Workday SUP Code manual input (per your request)
+# HUD Inputs
+# Workday SUP Code is manual input (per your request)
 # =========================================================
 st.divider()
 st.subheader("Step 2 — HUD Inputs")
@@ -487,31 +462,48 @@ prop = result["prop"] or {}
 def rec_val(rec: dict, key: str, default=""):
     return rec.get(key, default) if isinstance(rec, dict) else default
 
-# Prefill from Salesforce where available
-initial_advance_sf = parse_money(rec_val(prop, "Initial_Disbursement_Used__c", 0))
-total_reno_sf = parse_money(rec_val(prop, "Renovation_Advance_Amount_Used__c", 0))
-interest_reserve_sf = parse_money(rec_val(prop, "Interest_Allocation__c", 0))
-holdback_ratio_raw = rec_val(prop, "Holdback_To_Rehab_Ratio__c", "")
-borrower_name_sf = str(rec_val(prop, "Borrower_Name__c", "") or "").strip().upper()
-address_sf = str(rec_val(prop, "Full_Address__c", "") or "").strip().upper()
+# Defaults (set BEFORE widgets to avoid session_state errors)
+_default_total_loan = 0.0
+_default_adv_amt = 0.0
+_default_init_adv = parse_money(rec_val(prop, "Initial_Disbursement_Used__c", 0))
+_default_reno = parse_money(rec_val(prop, "Renovation_Advance_Amount_Used__c", 0))
+_default_int = parse_money(rec_val(prop, "Interest_Allocation__c", 0))
+_default_borrower = str(rec_val(prop, "Borrower_Name__c", "") or "").strip().upper()
+_default_addr = str(rec_val(prop, "Full_Address__c", "") or "").strip().upper()
+_default_holdback = normalize_pct(rec_val(prop, "Holdback_To_Rehab_Ratio__c", ""))
+
+_ensure_default("inp_total_loan_amount", fmt_money(_default_total_loan))
+_ensure_default("inp_advance_amount", fmt_money(_default_adv_amt))
+_ensure_default("inp_initial_advance", fmt_money(_default_init_adv))
+_ensure_default("inp_total_reno_drawn", fmt_money(_default_reno))
+_ensure_default("inp_interest_reserve", fmt_money(_default_int))
+
+_ensure_default("inp_borrower", _default_borrower)
+_ensure_default("inp_address", _default_addr)
+_ensure_default("inp_holdback", _default_holdback)
+_ensure_default("inp_advance_date", "")
+_ensure_default("inp_workday", "")
+
+_ensure_default("inp_inspection_fee", fmt_money(0.0))
+_ensure_default("inp_wire_fee", fmt_money(0.0))
+_ensure_default("inp_construction_mgmt_fee", fmt_money(0.0))
+_ensure_default("inp_title_fee", fmt_money(0.0))
 
 with st.form("hud_form"):
-    st.markdown("### Core Amounts")
-    total_loan_amount = money_text_input("Total Loan Amount", "inp_total_loan_amount", 0.0)
-    advance_amount = money_text_input("Advance Amount (this draw)", "inp_advance_amount", 0.0)
+    total_loan_amount = money_text_input("Total Loan Amount", "inp_total_loan_amount", _default_total_loan)
+    advance_amount = money_text_input("Advance Amount (this draw)", "inp_advance_amount", _default_adv_amt)
 
-    st.markdown("### Prefilled from Salesforce (editable)")
-    initial_advance = money_text_input("Initial Advance", "inp_initial_advance", float(initial_advance_sf))
-    total_reno_drawn = money_text_input("Total Reno Drawn", "inp_total_reno_drawn", float(total_reno_sf))
-    interest_reserve = money_text_input("Interest Reserve", "inp_interest_reserve", float(interest_reserve_sf))
+    initial_advance = money_text_input("Initial Advance", "inp_initial_advance", _default_init_adv)
+    total_reno_drawn = money_text_input("Total Reno Drawn", "inp_total_reno_drawn", _default_reno)
+    interest_reserve = money_text_input("Interest Reserve", "inp_interest_reserve", _default_int)
 
-    borrower_disp = st.text_input("Borrower", value=borrower_name_sf)
-    address_disp = st.text_input("Address", value=address_sf)
+    borrower_disp = st.text_input("Borrower", key="inp_borrower")
+    address_disp = st.text_input("Address", key="inp_address")
 
-    holdback_pct = st.text_input("Holdback % (optional)", value=normalize_pct(holdback_ratio_raw))
-    advance_date_raw = st.text_input("Advance Date", placeholder="MM/DD/YYYY")
+    holdback_pct = st.text_input("Holdback % (optional)", key="inp_holdback")
+    advance_date_raw = st.text_input("Advance Date", key="inp_advance_date", placeholder="MM/DD/YYYY")
 
-    workday_sup_code = st.text_input("Workday SUP Code (manual)", value="")
+    workday_sup_code = st.text_input("Workday SUP Code (manual)", key="inp_workday")
 
     st.markdown("### Fees")
     inspection_fee = money_text_input("3rd party Inspection Fee", "inp_inspection_fee", 0.0)
@@ -679,9 +671,16 @@ ctx = {
     "construction_mgmt_fee": float(construction_mgmt_fee),
     "title_fee": float(title_fee),
 }
-
 ctx = recompute(ctx)
 
 st.divider()
 st.subheader("HUD Preview")
 st.markdown(render_hud_html(ctx), unsafe_allow_html=True)
+
+# =========================================================
+# Your question:
+# "Do you want me to copy/paste the whole column list of other objects?"
+# Answer: Not necessary.
+# If a field name is wrong, this code already protects itself by only selecting fields that exist.
+# Only send more column lists if you WANT new fields added to the app.
+# =========================================================
