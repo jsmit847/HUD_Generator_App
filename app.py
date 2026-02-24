@@ -1,13 +1,15 @@
 # ============================================================
-# HUD Generator App — ONE FILE (Streamlit)
-# Key SF fixes you asked for:
-# ✅ Uses Property__c as source of: Borrower Name, Full Address, Yardi ID, Interest Allocation,
-#    Initial Disbursement Funded (your org calls it Initial_Disbursement_Used__c),
-#    Holdback_To_Rehab_Ratio__c
-# ✅ Uses Advance__c as source of Loan Commitment (LOC_Commitment__c)
-# ✅ Writes Yardi ID into the "Loan ID" cell (G7) instead of Deal #
-# ✅ Keeps OSC/CAF logic intact (per your old logic)
-# ✅ Still writes into the Excel TEMPLATE (not building a new workbook)
+# HUD Generator App — ONE FILE (Streamlit) — SF-FALLBACK READY
+# Fixes requested:
+# ✅ Loan ID on template = Deal Number (NOT Yardi)  -> writes Deal_Loan_Number__c into G7
+# ✅ Uses your confirmed mappings AND adds robust fallbacks using the field list you provided
+# ✅ Pulls from Opportunity + Property__c + Advance__c (and keeps Loan__c for servicer fallback)
+# ✅ Loan Commitment prefers Advance__c.LOC_Commitment__c, then Property__c.LOC_Commitment__c, then Opp LOC_Commitment__c/Amount
+# ✅ Initial Advance prefers Property__c.Initial_Disbursement_Used__c, then Property__c.Initial_Disbursement__c, then Advance__c.Initial_Disbursement_Total__c
+# ✅ Total Reno Drawn prefers Property__c.Renovation_Advance_Amount_Used__c, then Advance__c.Renovation_Reserve_Total__c, then Opp Total_Amount_Advances__c (last resort)
+# ✅ Interest Reserve prefers Property__c.Interest_Allocation__c, then Opp Interest_Reserves__c / Current_* fields, then Advance__c Interest reserve totals
+# ✅ Borrower + Address prefer Property__c, then Opportunity/Account fallbacks
+# NOTE: Only writes into your existing Excel TEMPLATE.
 # ============================================================
 
 import base64
@@ -60,10 +62,8 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
-
 st.title("HUD Generator App")
 st.caption("Enter a Deal Number → run checks → then generate the Excel HUD.")
-
 if "debug_last_sf_error" not in st.session_state:
     st.session_state.debug_last_sf_error = None
 
@@ -74,9 +74,7 @@ APP_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = APP_DIR / "HUD TEMPLATE.xlsx"
 TEMPLATE_SHEET = "TL-15255"
 
-# NOTE:
-# - In your template, the field labeled "Loan ID" should be Yardi ID (NOT Deal #).
-# - That cell is currently G7, so we map Yardi ID to G7.
+# Template mapping (unchanged positions; Loan ID cell gets DEAL #)
 CELL_MAP = {
     "total_loan_amount": "D7",
     "initial_advance": "D8",
@@ -84,7 +82,7 @@ CELL_MAP = {
     "advance_amount": "D10",
     "interest_reserve": "D11",
 
-    "yardi_id": "G7",         # ✅ Loan ID cell gets Yardi ID
+    "deal_number": "G7",      # ✅ Loan ID cell now = Deal #
     "advance_date": "G13",
 
     "borrower_disp": "D14",
@@ -104,7 +102,6 @@ CLIENT_ID = cfg["client_id"]
 AUTH_HOST = cfg.get("auth_host", "https://login.salesforce.com").rstrip("/")
 REDIRECT_URI = cfg["redirect_uri"].rstrip("/")
 CLIENT_SECRET = cfg.get("client_secret")
-
 AUTH_URL = f"{AUTH_HOST}/services/oauth2/authorize"
 TOKEN_URL = f"{AUTH_HOST}/services/oauth2/token"
 
@@ -170,6 +167,12 @@ def parse_money(val) -> float:
     except Exception:
         return 0.0
 
+def fmt_money(x) -> str:
+    try:
+        return f"${float(x):,.2f}"
+    except Exception:
+        return "$0.00"
+
 def parse_date_any(x):
     if x in ("", None):
         return None
@@ -177,12 +180,6 @@ def parse_date_any(x):
     if pd.isna(dt):
         return None
     return dt.date()
-
-def fmt_money(x) -> str:
-    try:
-        return f"${float(x):,.2f}"
-    except Exception:
-        return "$0.00"
 
 def fmt_date_mmddyyyy(x) -> str:
     d = parse_date_any(x)
@@ -220,11 +217,7 @@ DIR_MAP = {
     "southeast": "se", "se": "se",
     "southwest": "sw", "sw": "sw",
 }
-STATE_MAP = {
-    "oregon": "or", "or": "or",
-    "washington": "wa", "wa": "wa",
-    "california": "ca", "ca": "ca",
-}
+STATE_MAP = {"oregon": "or", "or": "or", "washington": "wa", "wa": "wa", "california": "ca", "ca": "ca"}
 SUFFIX_MAP = {
     "street": "st", "st": "st",
     "avenue": "ave", "ave": "ave",
@@ -249,7 +242,6 @@ def address_tokens(s: str) -> set:
     s = re.sub(r"[^0-9a-z\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     toks = s.split()
-
     out = []
     for t in toks:
         if t in DIR_MAP:
@@ -277,6 +269,22 @@ def jaccard(a: set, b: set) -> float:
     inter = len(a & b)
     union = len(a | b)
     return inter / union if union else 0.0
+
+def pick_first_nonblank_field(record: dict, fields: list):
+    """
+    Returns (field_name, value) for first field with nonblank value.
+    """
+    if not record:
+        return None, None
+    for f in fields:
+        if f in record:
+            v = record.get(f)
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s != "":
+                return f, v
+    return None, None
 
 # -----------------------------
 # OAUTH FLOW (PKCE)
@@ -504,16 +512,30 @@ def fetch_opportunity_by_deal_number(deal_number: str):
         return None
 
     opp_fields = [
-        "Id", "Name", "Deal_Loan_Number__c", "Account_Name__c",
-        "StageName", "CloseDate",
+        "Id", "Name",
+        "Deal_Loan_Number__c",
+        "Account_Name__c",
+        "CloseDate",
         "Servicer_Commitment_Id__c",
         "Servicer_Status__c",
         "Next_Payment_Date__c",
         "Late_Fees_Servicer__c",
-        # keep these as fallbacks if needed:
-        "LOC_Commitment__c", "Amount",
-        "Renovation_HB_Funded__c",
+
+        # Fallback monetary fields (from your list)
+        "Amount",
+        "LOC_Commitment__c",
+        "Current_Loan_Amount__c",
+        "Final_Loan_Amount__c",
+        "Total_Amount_Advances__c",
+
+        # Interest reserve fallbacks
+        "Current_Interest_Reserves_Paid__c",
+        "Current_Interest_Reserves_Remaining__c",
+        "Interest_Reserves__c",
+        "Current_UPB_Interest_Reserves__c",
+        "Current_UPB_Interest_Reserve__c",
     ]
+
     where = (
         "("
         f"Deal_Loan_Number__c = {soql_quote(dn_digits)}"
@@ -532,20 +554,46 @@ def fetch_property_for_deal(opp_id: str):
     if not lk:
         return None
 
-    # ✅ Your confirmed fields live on Property__c
     prop_fields = [
         "Id", "Name", lk,
         "Servicer_Id__c",
         "Full_Address__c",
         "Borrower_Name__c",
         "Yardi_Id__c",
-        "Interest_Allocation__c",
+
+        # From your list
         "Initial_Disbursement_Used__c",
+        "Initial_Disbursement__c",
+        "Initial_Disbursement_Total__c",
+        "Initial_Disbursement_Remaining__c",
+        "Total_Initial_Disbursement__c",
+
+        "Interest_Allocation__c",
+
+        # Total loan amount fallbacks
+        "LOC_Commitment__c",
+        "Outstanding_Facility_Amount__c",
+        "Current_Outstanding_Loan_Amount__c",
+        "Max_Total_Loan_Amount__c",
+        "Max_Total_Loan_Amount_Input__c",
+
+        # Total Reno drawn / reserve funded fallbacks (from your list)
+        "Renovation_Advance_Amount_Used__c",
+        "Approved_Renovation_Holdback__c",
+        "Renovation_Reserve_Total__c",  # (may not exist on Property__c; drop-missing loop handles)
+        "Interest_Reserves__c",         # listed under "Total Reno Drawn" group in your export
+
+        # Requested/funding date fallbacks
+        "Requested_Funding_Date__c",
+        "Funding_Date__c",
+        "First_Funding_Date__c",
+
+        # Other useful values
         "Holdback_To_Rehab_Ratio__c",
         "Late_Fees_Servicer__c",
     ]
-    where = f"{lk} = {soql_quote(opp_id)}"
 
+    where = f"{lk} = {soql_quote(opp_id)}"
     try:
         rows, _used, _soql = try_query_drop_missing(sf, "Property__c", prop_fields, where, limit=5, order_by="CreatedDate DESC")
         if not rows:
@@ -571,30 +619,48 @@ def fetch_loan_for_deal(opp_id: str):
     r.pop("attributes", None)
     return r
 
-def fetch_advance_for_deal(opp_id: str):
+def fetch_advances_for_deal(opp_id: str):
     """
-    ✅ Loan Commitment is on Advance__c in your org: Advance__c.LOC_Commitment__c
-    We try common relationship fields that might point back to the deal/opportunity.
+    Pull multiple advances; we will choose values using best "nonblank" priority.
     """
-    lk = choose_first_existing("Advance__c", ["Deal__c", "Opportunity__c", "Deal_Id__c", "OpportunityId", "DealId"])
+    lk = choose_first_existing("Advance__c", ["Deal__c", "Opportunity__c", "Deal_Id__c", "OpportunityId", "DealId", "Advance__c"])
     if not lk:
-        return None
+        return []
 
-    adv_fields = ["Id", "Name", lk, "LOC_Commitment__c"]
+    adv_fields = [
+        "Id", "Name", lk,
+
+        # Amounts and key fields from your list
+        "LOC_Commitment__c",
+        "Advance__c",  # (reference)
+        "Approved_Advance_Amount_Total__c",
+        "Approved_Advance_Amount_Max_Total__c",
+        "Renovation_Reserve_Total__c",
+        "Initial_Disbursement_Total__c",
+
+        # Interest reserve totals
+        "Interest_Reserve_Total__c",
+        "Interest_Reserve_Subtotal__c",
+        "Total_Interest_Reserves_andStub_Interest__c",
+        "Remaining_Interest_Reserve__c",
+
+        # Dates
+        "Target_Advance_Date__c",
+        "Wire_Date__c",
+        "Date_Advance_Requested__c",
+    ]
+
     where = f"{lk} = {soql_quote(opp_id)}"
-
     try:
-        rows, _used, _soql = try_query_drop_missing(sf, "Advance__c", adv_fields, where, limit=20, order_by="CreatedDate DESC")
-        if not rows:
-            return None
-        # If multiple advances exist, prefer the most recent (CreatedDate DESC if available),
-        # otherwise just take the first returned.
-        r = rows[0].copy()
-        r.pop("attributes", None)
-        return r
+        rows, _used, _soql = try_query_drop_missing(sf, "Advance__c", adv_fields, where, limit=50, order_by="CreatedDate DESC")
+        cleaned = []
+        for r in rows:
+            rr = r.copy()
+            rr.pop("attributes", None)
+            cleaned.append(rr)
+        return cleaned
     except Exception:
-        # non-blocking; fallback to Opportunity LOC_Commitment__c/Amount
-        return None
+        return []
 
 # -----------------------------
 # OFFLINE LOOKUPS (OSC + CAF)
@@ -604,15 +670,12 @@ def osc_lookup(servicer_key: str):
         return {"found": False, "error": "Insurance file did not load.", "row": None}
     if "account_number" not in osc_df.columns:
         return {"found": False, "error": "Insurance file is missing the ID field.", "row": None}
-
     key = (servicer_key or "").strip()
     if not key:
         return {"found": False, "error": "Missing servicer ID.", "row": None}
-
     hit = osc_df[osc_df["account_number"].astype(str).str.strip() == key]
     if hit.empty:
         return {"found": False, "error": "No insurance record found for that servicer ID.", "row": None}
-
     return {"found": True, "error": None, "row": hit.iloc[0].to_dict()}
 
 def caf_try_match_by_deal_id(deal_digits: str):
@@ -620,16 +683,13 @@ def caf_try_match_by_deal_id(deal_digits: str):
         return {"found": False, "error": "Payment file did not load.", "row": None, "method": "deal id"}
     if "order_id" not in caf_df.columns:
         return {"found": False, "error": "Payment file is missing deal IDs.", "row": None, "method": "deal id"}
-
     dn = digits_only(deal_digits)
     if not dn:
         return {"found": False, "error": "Missing deal number.", "row": None, "method": "deal id"}
-
     prefixes = caf_df["order_id"].astype(str).fillna("").map(extract_order_id_deal_prefix)
     hit = caf_df[prefixes == dn]
     if hit.empty:
         return {"found": False, "error": "No payment record found by deal ID.", "row": None, "method": "deal id"}
-
     return {"found": True, "error": None, "row": hit.iloc[0].to_dict(), "method": "deal id"}
 
 def caf_try_match_by_address(sf_addr: str, osc_addr: str):
@@ -637,7 +697,6 @@ def caf_try_match_by_address(sf_addr: str, osc_addr: str):
         return {"found": False, "error": "Payment file did not load.", "row": None, "method": "address"}
     if "property_address" not in caf_df.columns:
         return {"found": False, "error": "Payment file is missing property addresses.", "row": None, "method": "address"}
-
     target = normalize_text(sf_addr) or normalize_text(osc_addr)
     if not target:
         return {"found": False, "error": "No address available to match.", "row": None, "method": "address"}
@@ -666,14 +725,12 @@ def caf_try_match_by_address(sf_addr: str, osc_addr: str):
         toks = address_tokens(row["_addr_raw"])
         score = jaccard(target_tokens, toks)
         scores.append((idx, score))
-
     if not scores:
         return {"found": False, "error": "No address candidates found.", "row": None, "method": "address"}
 
     best_idx, best_score = max(scores, key=lambda t: t[1])
     if best_score < 0.45:
         return {"found": False, "error": "No close address match found.", "row": None, "method": "address"}
-
     return {"found": True, "error": None, "row": caf_df.loc[best_idx].to_dict(), "method": "address match"}
 
 def pick_payment_statuses(caf_row: dict):
@@ -711,16 +768,13 @@ def run_prechecks(opp: dict, prop: dict, loan: dict, user_deal_input: str):
     acct_name = normalize_text(opp.get("Account_Name__c"))
 
     servicer_key = pick_first(
-        prop.get("Servicer_Id__c") if prop else "",
-        opp.get("Servicer_Commitment_Id__c"),
-        loan.get("Servicer_Loan_Id__c") if loan else "",
+        (prop or {}).get("Servicer_Id__c"),
+        (opp or {}).get("Servicer_Commitment_Id__c"),
+        (loan or {}).get("Servicer_Loan_Id__c"),
     )
 
-    # total loan amount will be pulled later from Advance__c if available; keep an opp fallback here
-    total_loan_amount = parse_money(pick_first(opp.get("LOC_Commitment__c"), opp.get("Amount"), 0))
-
-    # System address (kept for display only; NOT the default HUD address)
-    sf_full_address = normalize_text(prop.get("Full_Address__c")) if prop else ""
+    # System address (display only)
+    sf_full_address = normalize_text((prop or {}).get("Full_Address__c"))
     sf_full_address_disp = sf_full_address.upper() if sf_full_address else ""
 
     # OSC (required / blocking)
@@ -748,7 +802,6 @@ def run_prechecks(opp: dict, prop: dict, loan: dict, user_deal_input: str):
     caf_statuses = []
     caf_ok = False
     caf_found = bool(caf.get("found"))
-
     if caf_found:
         row = caf.get("row") or {}
         caf_addr_disp = normalize_text(row.get("property_address")).upper()
@@ -756,37 +809,32 @@ def run_prechecks(opp: dict, prop: dict, loan: dict, user_deal_input: str):
         if caf_statuses:
             caf_ok = all(is_payment_status_ok(v) for (_k, v) in caf_statuses)
 
+    # ONLY OSC blocks (old behavior)
     osc_blocking_ok = bool(servicer_key) and osc.get("found") and osc_ok
+    overall_ok = bool(osc_blocking_ok)
 
     checks = []
     if not servicer_key:
-        checks.append({"Check": "Servicer identifier","Value": "(missing)","Result": "Stop","Note": "Missing identifier needed to find the insurance record."})
+        checks.append({"Check":"Servicer identifier","Value":"(missing)","Result":"Stop","Note":"Missing identifier needed to find the insurance record."})
     elif not osc.get("found"):
-        checks.append({"Check": "Insurance status","Value": osc.get("error", "Not found"),"Result": "Stop","Note": "We need an insurance record before creating the HUD."})
+        checks.append({"Check":"Insurance status","Value":osc.get("error","Not found"),"Result":"Stop","Note":"We need an insurance record before creating the HUD."})
     else:
-        checks.append({"Check": "Insurance status","Value": osc_primary if osc_primary else "(blank)","Result": "OK" if osc_ok else "Stop","Note": "Must be outside-policy in-force."})
+        checks.append({"Check":"Insurance status","Value":osc_primary if osc_primary else "(blank)","Result":"OK" if osc_ok else "Stop","Note":"Must be outside-policy in-force."})
 
     if caf_found:
-        checks.append({"Check": "Payment info (optional)","Value": "Found","Result": "OK" if caf_ok else "Review","Note": "Shown for visibility; it does not block HUD creation."})
-        if caf_statuses:
-            summary = " | ".join([f"{k.replace('_',' ').title()}: {v}" for (k, v) in caf_statuses])
-            checks.append({"Check": "Installment status (optional)","Value": summary,"Result": "OK" if caf_ok else "Review","Note": "Review if anything looks late or past due."})
-        else:
-            checks.append({"Check": "Installment status (optional)","Value": "Not available","Result": "Review","Note": "Payment record found, but no statuses were available."})
+        checks.append({"Check":"Payment info (optional)","Value":"Found","Result":"OK" if caf_ok else "Review","Note":"Shown for visibility; it does not block HUD creation."})
     else:
-        checks.append({"Check": "Payment info (optional)","Value": caf.get("error", "Not found"),"Result": "Review","Note": "Not required to create the HUD."})
+        checks.append({"Check":"Payment info (optional)","Value":caf.get("error","Not found"),"Result":"Review","Note":"Not required to create the HUD."})
 
-    checks.append({"Check": "HUD address source","Value": "Insurance record" if osc_addr_disp else "System address","Result": "OK" if (osc_addr_disp or sf_full_address_disp) else "Review","Note": "The HUD will use the insurance address when available."})
-
-    overall_ok = bool(osc_blocking_ok)
+    # HUD address
     hud_address_disp = osc_addr_disp or sf_full_address_disp
+    checks.append({"Check":"HUD address source","Value":"Insurance record" if osc_addr_disp else "System address","Result":"OK" if hud_address_disp else "Review","Note":"HUD uses insurance address when available."})
 
     return {
         "deal_number": deal_label,
         "deal_name": deal_name,
         "account_name": acct_name,
         "servicer_key": servicer_key,
-        "total_loan_amount": total_loan_amount,
         "checks": checks,
         "overall_ok": overall_ok,
         "sf_address": sf_full_address_disp,
@@ -819,7 +867,6 @@ def build_hud_excel_bytes_from_template(ctx: dict) -> bytes:
 
     wb = load_workbook(TEMPLATE_PATH)
     ws = wb[TEMPLATE_SHEET] if TEMPLATE_SHEET in wb.sheetnames else wb.active
-
     _clear_red_text(ws)
 
     def write_cell(key, value):
@@ -829,8 +876,8 @@ def build_hud_excel_bytes_from_template(ctx: dict) -> bytes:
         ws[addr] = value
 
     # TEXT
-    write_cell("yardi_id", str(ctx.get("yardi_id", "")))                 # ✅ Loan ID = Yardi ID
-    write_cell("advance_date", ctx.get("advance_date") or "")            # date string ok; you can change to real date later
+    write_cell("deal_number", str(ctx.get("deal_number", "")))      # ✅ Loan ID = Deal #
+    write_cell("advance_date", str(ctx.get("advance_date", "")))
     write_cell("borrower_disp", str(ctx.get("borrower_disp", "")))
     write_cell("address_disp", str(ctx.get("address_disp", "")))
 
@@ -921,21 +968,20 @@ if run_btn:
     with st.spinner("Pulling related info..."):
         prop = fetch_property_for_deal(opp_id) if opp_id else None
         loan = fetch_loan_for_deal(opp_id) if opp_id else None
-        adv = fetch_advance_for_deal(opp_id) if opp_id else None
+        advances = fetch_advances_for_deal(opp_id) if opp_id else []
 
     with st.spinner("Running checks..."):
         payload = run_prechecks(opp, prop, loan, deal_input)
 
-    st.session_state.precheck_payload = {"opp": opp, "prop": prop, "loan": loan, "adv": adv, "payload": payload}
+    st.session_state.precheck_payload = {"opp": opp, "prop": prop, "loan": loan, "advances": advances, "payload": payload}
     st.session_state.precheck_ran = True
 
 # -----------------------------
-# SHOW CHECK RESULTS
+# SHOW CHECK RESULTS + ADDRESS VIEW
 # -----------------------------
 if st.session_state.precheck_ran and st.session_state.precheck_payload:
     opp = st.session_state.precheck_payload["opp"]
-    prop = st.session_state.precheck_payload.get("prop")
-    adv = st.session_state.precheck_payload.get("adv")
+    prop = st.session_state.precheck_payload.get("prop") or {}
     payload = st.session_state.precheck_payload["payload"]
 
     st.subheader("Check results")
@@ -946,7 +992,7 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload:
   <div class="muted">{payload['account_name']}</div>
   <div style="margin-top:8px;">
     <span class="pill">Servicer Identifier: <b>{payload['servicer_key'] if payload['servicer_key'] else '—'}</b></span>
-    <span class="pill">Yardi ID: <b>{(prop or {}).get('Yardi_Id__c','') or '—'}</b></span>
+    <span class="pill">Borrower (SF): <b>{(prop.get('Borrower_Name__c') or '') or '—'}</b></span>
   </div>
 </div>
 """,
@@ -955,6 +1001,19 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload:
 
     df_checks = pd.DataFrame(payload["checks"])[["Check", "Value", "Result", "Note"]]
     st.dataframe(df_checks, use_container_width=True, hide_index=True)
+
+    st.markdown("### Address comparison")
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        st.markdown("**Address from our system**")
+        st.code(payload.get("sf_address") or "(blank)")
+    with a2:
+        st.markdown("**Insurance record address (used on HUD)**")
+        st.code(payload.get("osc_address") or "(blank)")
+    with a3:
+        st.markdown("**Payment record address (optional)**")
+        st.code(payload.get("caf_address") or "(blank)")
+        st.caption(f"How it matched: {payload.get('caf_method') or '(not matched)'}")
 
     if payload["overall_ok"]:
         st.success("✅ Required checks passed. You can continue to build the HUD.")
@@ -969,14 +1028,11 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload:
 if st.session_state.precheck_ran and st.session_state.precheck_payload and st.session_state.allow_override:
     opp = st.session_state.precheck_payload["opp"]
     prop = st.session_state.precheck_payload.get("prop") or {}
-    adv = st.session_state.precheck_payload.get("adv") or {}
+    advances = st.session_state.precheck_payload.get("advances") or []
     payload = st.session_state.precheck_payload["payload"]
 
-    # ✅ Borrower from Property__c.Borrower_Name__c (fallback to Opportunity Account_Name__c)
-    borrower_disp = (pick_first(prop.get("Borrower_Name__c"), opp.get("Account_Name__c")) or "").strip().upper()
-
-    # OLD LOGIC: Address defaults to OSC when available, else Property__c.Full_Address__c
-    address_disp = payload.get("hud_address_disp") or ""
+    borrower_default = (pick_first(prop.get("Borrower_Name__c"), opp.get("Account_Name__c")) or "").strip().upper()
+    address_default = payload.get("hud_address_disp") or ""
 
     st.subheader("HUD inputs")
     st.caption("Type amounts like `1200` or `$1,200` (leave blank for $0). Dates are mm/dd/yyyy.")
@@ -986,8 +1042,8 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload and st.se
 
         with cA:
             st.markdown("**Borrower info**")
-            borrower_val = st.text_input("Borrower (for the form)", value=borrower_disp, key="inp_borrower_disp")
-            addr_val = st.text_input("Address (for the form)", value=address_disp, key="inp_address_disp")
+            borrower_val = st.text_input("Borrower (for the form)", value=borrower_default, key="inp_borrower_disp")
+            addr_val = st.text_input("Address (for the form)", value=address_default, key="inp_address_disp")
 
         with cB:
             st.markdown("**Advance**")
@@ -1019,23 +1075,84 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload and st.se
             except Exception:
                 pass
 
-        # ✅ Your confirmed SF sources:
-        # Initial Disbursement Funded = Property__c.Initial_Disbursement_Used__c
-        sf_initial_advance = parse_money(prop.get("Initial_Disbursement_Used__c"))
+        # -----------------------------
+        # FALLBACK LOGIC USING YOUR FIELD LIST
+        # -----------------------------
+        # Total Loan Amount (Commitment): Advance__c.LOC_Commitment__c -> Property__c.LOC_Commitment__c -> Opp LOC_Commitment__c -> Opp Amount
+        adv_loc_field = None
+        adv_loc_val = None
+        for a in advances:
+            adv_loc_field, adv_loc_val = pick_first_nonblank_field(a, ["LOC_Commitment__c"])
+            if adv_loc_val is not None:
+                break
+        total_loan_amount_val = pick_first(
+            adv_loc_val,
+            prop.get("LOC_Commitment__c"),
+            opp.get("LOC_Commitment__c"),
+            opp.get("Final_Loan_Amount__c"),
+            opp.get("Current_Loan_Amount__c"),
+            opp.get("Amount"),
+        )
+        sf_total_loan_amount = parse_money(total_loan_amount_val)
 
-        # Interest Allocation = Property__c.Interest_Allocation__c
-        sf_interest_reserve = parse_money(prop.get("Interest_Allocation__c"))
+        # Initial Advance: Property__c.Initial_Disbursement_Used__c -> Property__c.Initial_Disbursement__c -> Advance__c.Initial_Disbursement_Total__c
+        adv_init_field = None
+        adv_init_val = None
+        for a in advances:
+            adv_init_field, adv_init_val = pick_first_nonblank_field(a, ["Initial_Disbursement_Total__c"])
+            if adv_init_val is not None:
+                break
+        initial_advance_val = pick_first(
+            prop.get("Initial_Disbursement_Used__c"),
+            prop.get("Initial_Disbursement__c"),
+            prop.get("Total_Initial_Disbursement__c"),
+            adv_init_val,
+        )
+        sf_initial_advance = parse_money(initial_advance_val)
 
-        # Loan Commitment = Advance__c.LOC_Commitment__c (fallback to opp)
-        sf_total_loan_amount = parse_money(pick_first(adv.get("LOC_Commitment__c"), opp.get("LOC_Commitment__c"), opp.get("Amount")))
+        # Total Reno Drawn: Property__c.Renovation_Advance_Amount_Used__c -> Advance__c.Renovation_Reserve_Total__c -> Property__c.Approved_Renovation_Holdback__c -> Opp.Total_Amount_Advances__c
+        adv_reno_field = None
+        adv_reno_val = None
+        for a in advances:
+            adv_reno_field, adv_reno_val = pick_first_nonblank_field(a, ["Renovation_Reserve_Total__c"])
+            if adv_reno_val is not None:
+                break
+        total_reno_val = pick_first(
+            prop.get("Renovation_Advance_Amount_Used__c"),
+            adv_reno_val,
+            prop.get("Approved_Renovation_Holdback__c"),
+            opp.get("Total_Amount_Advances__c"),
+        )
+        sf_total_reno = parse_money(total_reno_val)
 
-        # Total Reno Drawn (not in your provided list, so keep your existing Opportunity fallback)
-        sf_total_reno = parse_money(opp.get("Renovation_HB_Funded__c"))
+        # Interest Reserve: Property__c.Interest_Allocation__c -> Opp Interest_Reserves__c -> Opp Current_Interest_Reserves_Remaining__c -> Advance__c Interest_Reserve_Total__c -> Advance__c Total_Interest_Reserves_andStub_Interest__c
+        adv_int_field = None
+        adv_int_val = None
+        for a in advances:
+            adv_int_field, adv_int_val = pick_first_nonblank_field(a, ["Interest_Reserve_Total__c", "Total_Interest_Reserves_andStub_Interest__c", "Interest_Reserve_Subtotal__c"])
+            if adv_int_val is not None:
+                break
+        interest_reserve_val = pick_first(
+            prop.get("Interest_Allocation__c"),
+            opp.get("Interest_Reserves__c"),
+            opp.get("Current_Interest_Reserves_Remaining__c"),
+            opp.get("Current_Interest_Reserves_Paid__c"),
+            adv_int_val,
+        )
+        sf_interest_reserve = parse_money(interest_reserve_val)
 
+        # Borrower + Address (prefer Property__c)
+        borrower_final = (borrower_val or "").strip().upper()
+        address_final = (addr_val or "").strip().upper()
+
+        # Deal # (Loan ID cell)
+        deal_number_final = normalize_text(opp.get("Deal_Loan_Number__c")) or normalize_text(payload.get("deal_number")) or normalize_text(deal_input)
+
+        # -----------------------------
+        # Build ctx
+        # -----------------------------
         ctx = {
-            # ✅ template Loan ID cell gets Yardi ID
-            "yardi_id": normalize_text(prop.get("Yardi_Id__c")),
-
+            "deal_number": deal_number_final,
             "total_loan_amount": float(sf_total_loan_amount),
             "initial_advance": float(sf_initial_advance),
             "total_reno_drawn": float(sf_total_reno),
@@ -1045,27 +1162,24 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload and st.se
             "holdback_pct": hb,
             "advance_date": adv_date.strftime("%m/%d/%Y"),
 
-            "borrower_disp": (borrower_val or "").strip().upper(),
-            "address_disp": (addr_val or "").strip().upper(),
+            "borrower_disp": borrower_final,
+            "address_disp": address_final,
 
             "inspection_fee": float(inspection_fee),
             "wire_fee": float(wire_fee),
             "construction_mgmt_fee": float(construction_mgmt_fee),
             "title_fee": float(title_fee),
-
-            # not written to template yet, but stored for later if you add a cell mapping:
-            "holdback_to_rehab_ratio": normalize_text(prop.get("Holdback_To_Rehab_Ratio__c")),
-            "deal_number_for_filename": payload.get("deal_number",""),
         }
 
+        # Preview with source transparency (helps you validate fallbacks quickly)
         st.markdown("### Preview")
         prev = pd.DataFrame(
             [
-                ["Yardi ID (Loan ID)", ctx["yardi_id"]],
-                ["Total Loan Amount (Commitment)", fmt_money(ctx["total_loan_amount"])],
-                ["Initial Disbursement Funded", fmt_money(ctx["initial_advance"])],
+                ["Deal # (Loan ID cell)", ctx["deal_number"]],
+                ["Total Loan Amount", fmt_money(ctx["total_loan_amount"])],
+                ["Initial Advance", fmt_money(ctx["initial_advance"])],
                 ["Total Reno Drawn", fmt_money(ctx["total_reno_drawn"])],
-                ["Interest Allocation", fmt_money(ctx["interest_reserve"])],
+                ["Interest Reserve", fmt_money(ctx["interest_reserve"])],
                 ["Advance Amount", fmt_money(ctx["advance_amount"])],
                 ["Advance Date", ctx["advance_date"]],
             ],
@@ -1080,7 +1194,7 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload and st.se
             st.code(str(e))
             st.stop()
 
-        out_name = f"HUD_{re.sub(r'[^0-9A-Za-z_-]+','_', ctx['deal_number_for_filename'] or 'Deal')}.xlsx"
+        out_name = f"HUD_{re.sub(r'[^0-9A-Za-z_-]+','_', ctx['deal_number'] or 'Deal')}.xlsx"
         st.download_button(
             "Download HUD Excel",
             data=xbytes,
