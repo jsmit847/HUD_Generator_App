@@ -1,9 +1,15 @@
 # ============================================================
 # HUD Generator App — ONE FILE (Streamlit)
 # - Salesforce OAuth (Auth Code + PKCE)
-# - Required prechecks:
-#     ✅ CAF: try Deal-ID match first (Order Id prefix), then smart address match (order-insensitive)
-#     ✅ OSC: match by Servicer ID and show insurance status
+# - Prechecks aligned to your OLD logic (minus FCI):
+#     ✅ OSC is REQUIRED + BLOCKING:
+#         - match by Servicer ID (OSC Account Number)
+#         - must be "Outside Policy In-Force"
+#         - HUD address auto-fills from OSC address pieces
+#     ✅ CAF is OPTIONAL (best-effort, DOES NOT BLOCK):
+#         - try Deal-ID match first (Order Id prefix)
+#         - then smart address match (order-insensitive)
+#         - show installment statuses if found
 # - Beginner-friendly UI language (no object/column jargon shown)
 # - Dates displayed as mm/dd/yyyy
 # - HUD output writes INTO your Excel TEMPLATE (from your GitHub repo)
@@ -63,7 +69,7 @@ st.markdown(
 )
 
 st.title("HUD Generator App")
-st.caption("Enter a Deal Number → required checks run first → then you can generate the Excel HUD.")
+st.caption("Enter a Deal Number → run checks → then generate the Excel HUD.")
 
 if "debug_last_sf_error" not in st.session_state:
     st.session_state.debug_last_sf_error = None
@@ -71,29 +77,22 @@ if "debug_last_sf_error" not in st.session_state:
 # -----------------------------
 # TEMPLATE SETTINGS (GitHub repo)
 # -----------------------------
-# Put your template here in your repo:
-#   assets/HUD TEMPLATE.xlsx
 TEMPLATE_PATH = Path(__file__).parent / "assets" / "HUD TEMPLATE.xlsx"
 TEMPLATE_SHEET = "TL-15255"  # change if your tab name differs
 
-# Cell mapping for your template (based on the template you shared)
 CELL_MAP = {
-    # Top summary
     "total_loan_amount": "D7",
     "initial_advance": "D8",
     "total_reno_drawn": "D9",
     "advance_amount": "D10",
     "interest_reserve": "D11",
 
-    # Identifiers / dates
-    "deal_number": "G7",      # merged G7:I7 in template, write to G7
+    "deal_number": "G7",
     "advance_date": "G13",
 
-    # Borrower / Address
     "borrower_disp": "D14",
     "address_disp": "D15",
 
-    # Fee inputs (merged H:I — write to H cell)
     "inspection_fee": "H21",
     "wire_fee": "H22",
     "construction_mgmt_fee": "H23",
@@ -101,7 +100,7 @@ CELL_MAP = {
 }
 
 # -----------------------------
-# SECRETS (Streamlit secrets.toml)
+# SECRETS
 # -----------------------------
 cfg = st.secrets["salesforce"]
 CLIENT_ID = cfg["client_id"]
@@ -127,7 +126,7 @@ def make_challenge(verifier: str) -> str:
 
 @st.cache_resource
 def pkce_store():
-    return {}  # state -> (verifier, created_epoch)
+    return {}
 
 store = pkce_store()
 now = time.time()
@@ -204,18 +203,12 @@ def norm(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def extract_order_id_deal_prefix(order_id_val: str) -> str:
-    """
-    Example: '61543-XYZ' -> '61543'
-    """
     if not order_id_val:
         return ""
     left = str(order_id_val).split("-", 1)[0].strip()
     return digits_only(left)
 
 def strip_zip4(s: str) -> str:
-    """
-    '97224-1234' -> '97224'
-    """
     if not s:
         return ""
     return re.sub(r"(\b\d{5})-\d{4}\b", r"\1", str(s))
@@ -252,10 +245,6 @@ SUFFIX_MAP = {
 }
 
 def address_tokens(s: str) -> set:
-    """
-    Normalize address into a set of tokens so ordering doesn’t matter.
-    Handles: ZIP+4, punctuation, SOUTHWEST vs SW, TERRACE vs TER, OREGON vs OR, etc.
-    """
     if not s:
         return set()
     s = strip_zip4(str(s)).lower()
@@ -581,13 +570,14 @@ def fetch_loan_for_deal(opp_id: str):
 # -----------------------------
 def osc_lookup(servicer_key: str):
     """
-    Match by servicer ID against OSC 'Account Number'.
+    REQUIRED + BLOCKING (like your old app):
+    Must find a match and must be Outside Policy In-Force.
     """
     if osc_df.empty:
         return {"found": False, "error": "Insurance file did not load.", "row": None}
 
     if "account_number" not in osc_df.columns:
-        return {"found": False, "error": "Insurance file is missing the ID column.", "row": None}
+        return {"found": False, "error": "Insurance file is missing the ID field.", "row": None}
 
     key = (servicer_key or "").strip()
     if not key:
@@ -601,13 +591,13 @@ def osc_lookup(servicer_key: str):
 
 def caf_try_match_by_deal_id(deal_digits: str):
     """
-    Match CAF by Order Id prefix: DEAL-...
+    OPTIONAL (like old ICE): best-effort match only.
     """
     if caf_df.empty:
         return {"found": False, "error": "Payment file did not load.", "row": None, "method": "deal id"}
 
     if "order_id" not in caf_df.columns:
-        return {"found": False, "error": "Payment file is missing the deal ID field.", "row": None, "method": "deal id"}
+        return {"found": False, "error": "Payment file is missing deal IDs.", "row": None, "method": "deal id"}
 
     dn = digits_only(deal_digits)
     if not dn:
@@ -621,12 +611,6 @@ def caf_try_match_by_deal_id(deal_digits: str):
     return {"found": True, "error": None, "row": hit.iloc[0].to_dict(), "method": "deal id"}
 
 def caf_try_match_by_address(sf_addr: str, osc_addr: str):
-    """
-    Smart address match:
-    - ignores ZIP+4
-    - handles SOUTHWEST vs SW, TERRACE vs TER, OREGON vs OR
-    - ignores ordering and punctuation
-    """
     if caf_df.empty:
         return {"found": False, "error": "Payment file did not load.", "row": None, "method": "address"}
 
@@ -670,7 +654,7 @@ def caf_try_match_by_address(sf_addr: str, osc_addr: str):
     if best_score < 0.45:
         return {"found": False, "error": "No close address match found.", "row": None, "method": "address"}
 
-    return {"found": True, "error": None, "row": caf_df.loc[best_idx].to_dict(), "method": f"address (score {best_score:.2f})"}
+    return {"found": True, "error": None, "row": caf_df.loc[best_idx].to_dict(), "method": f"address match"}
 
 def pick_payment_statuses(caf_row: dict):
     out = []
@@ -695,7 +679,10 @@ def is_payment_status_ok(val: str) -> bool:
     return not any(w in t for w in bad_words)
 
 # -----------------------------
-# PRECHECKS (required) + BEGINNER-FRIENDLY OUTPUT
+# PRECHECKS (OLD LOGIC STYLE)
+# - OSC is required and blocks
+# - CAF is optional and never blocks
+# - HUD address auto-fills from OSC (like old app)
 # -----------------------------
 TARGET_INSURANCE_OK = "outside policy in-force"
 
@@ -715,11 +702,11 @@ def run_prechecks(opp: dict, prop: dict, loan: dict, user_deal_input: str):
 
     total_loan_amount = parse_money(pick_first(opp.get("LOC_Commitment__c"), opp.get("Amount"), 0))
 
-    # Address auto-fill (not used for deal-id matching)
+    # System address (kept for display only; NOT the default HUD address)
     sf_full_address = normalize_text(prop.get("Full_Address__c")) if prop else ""
     sf_full_address_disp = sf_full_address.upper() if sf_full_address else ""
 
-    # OSC (insurance)
+    # OSC (required / blocking)
     osc = osc_lookup(servicer_key)
     osc_primary = ""
     osc_ok = False
@@ -735,7 +722,7 @@ def run_prechecks(opp: dict, prop: dict, loan: dict, user_deal_input: str):
             normalize_text(r.get("property_zip")),
         ]).strip().upper()
 
-    # CAF (payments): deal-id first, then address similarity
+    # CAF (optional / best-effort)
     caf = caf_try_match_by_deal_id(deal_digits)
     if not caf.get("found"):
         caf = caf_try_match_by_address(sf_full_address, osc_addr_disp)
@@ -743,41 +730,30 @@ def run_prechecks(opp: dict, prop: dict, loan: dict, user_deal_input: str):
     caf_addr_disp = ""
     caf_statuses = []
     caf_ok = False
-    if caf.get("found"):
+    caf_found = bool(caf.get("found"))
+
+    if caf_found:
         row = caf.get("row") or {}
         caf_addr_disp = normalize_text(row.get("property_address")).upper()
         caf_statuses = pick_payment_statuses(row)
         if caf_statuses:
             caf_ok = all(is_payment_status_ok(v) for (_k, v) in caf_statuses)
 
+    # REQUIRED results (old behavior):
+    # - OSC must exist and be OK
+    osc_blocking_ok = bool(servicer_key) and osc.get("found") and osc_ok
+
     checks = []
 
-    # Show addresses (beginner-friendly)
-    checks.append({
-        "Check": "Address we will auto-fill",
-        "Value": sf_full_address_disp if sf_full_address_disp else "(blank)",
-        "Result": "OK" if sf_full_address_disp else "Review",
-        "Note": "This will appear on the HUD form."
-    })
-
-    # CAF match status
-    if caf.get("found"):
+    # OSC (blocking)
+    if not servicer_key:
         checks.append({
-            "Check": "Payment record found",
-            "Value": caf.get("method", "matched"),
-            "Result": "OK",
-            "Note": "Matched successfully."
-        })
-    else:
-        checks.append({
-            "Check": "Payment record found",
-            "Value": caf.get("error", "Not found"),
+            "Check": "Servicer identifier",
+            "Value": "(missing)",
             "Result": "Stop",
-            "Note": "We need a matching payment record before creating the HUD."
+            "Note": "Missing identifier needed to find the insurance record."
         })
-
-    # Insurance status (required)
-    if not osc["found"]:
+    elif not osc.get("found"):
         checks.append({
             "Check": "Insurance status",
             "Value": osc.get("error", "Not found"),
@@ -792,32 +768,50 @@ def run_prechecks(opp: dict, prop: dict, loan: dict, user_deal_input: str):
             "Note": "Must be outside-policy in-force."
         })
 
-    # Payment statuses (required)
-    if not caf.get("found"):
+    # CAF (optional, does NOT block)
+    if caf_found:
         checks.append({
-            "Check": "Installment payment status",
-            "Value": "Not checked (no payment record found)",
-            "Result": "Stop",
-            "Note": "Match a payment record first."
+            "Check": "Payment info (optional)",
+            "Value": "Found",
+            "Result": "OK" if caf_ok else "Review",
+            "Note": "Shown for visibility; it does not block HUD creation."
         })
-    else:
         if caf_statuses:
             summary = " | ".join([f"{k.replace('_',' ').title()}: {v}" for (k, v) in caf_statuses])
             checks.append({
-                "Check": "Installment payment status",
+                "Check": "Installment status (optional)",
                 "Value": summary,
                 "Result": "OK" if caf_ok else "Review",
                 "Note": "Review if anything looks late or past due."
             })
         else:
             checks.append({
-                "Check": "Installment payment status",
-                "Value": "Statuses not found",
+                "Check": "Installment status (optional)",
+                "Value": "Not available",
                 "Result": "Review",
-                "Note": "Payment record found, but statuses were not present."
+                "Note": "Payment record found, but no statuses were available."
             })
+    else:
+        checks.append({
+            "Check": "Payment info (optional)",
+            "Value": caf.get("error", "Not found"),
+            "Result": "Review",
+            "Note": "Not required to create the HUD."
+        })
 
-    overall_ok = bool(servicer_key) and osc_ok and caf.get("found") and bool(caf_statuses) and caf_ok
+    # Address info (what will be used)
+    checks.append({
+        "Check": "HUD address source",
+        "Value": "Insurance record" if osc_addr_disp else "System address",
+        "Result": "OK" if (osc_addr_disp or sf_full_address_disp) else "Review",
+        "Note": "The HUD will use the insurance address when available."
+    })
+
+    # OLD STYLE overall gating: ONLY OSC blocks
+    overall_ok = bool(osc_blocking_ok)
+
+    # Address auto-fill should follow old behavior: OSC first, fallback to system address
+    hud_address_disp = osc_addr_disp or sf_full_address_disp
 
     return {
         "deal_number": deal_label,
@@ -831,28 +825,21 @@ def run_prechecks(opp: dict, prop: dict, loan: dict, user_deal_input: str):
         "osc_address": osc_addr_disp,
         "caf_address": caf_addr_disp,
         "caf_method": caf.get("method", ""),
+        "hud_address_disp": hud_address_disp,
     }
 
 # -----------------------------
 # EXCEL TEMPLATE OUTPUT (NO RED INSTRUCTIONS)
 # -----------------------------
 def _is_red_font(cell) -> bool:
-    """
-    Detects “red writing” based on font color.
-    Common Excel red is RGB like FFFF0000 or FF0000.
-    """
     c = getattr(getattr(cell, "font", None), "color", None)
     rgb = getattr(c, "rgb", None)
     if not rgb:
         return False
     rgb = str(rgb).upper()
-    return "FF0000" in rgb  # catches FFFF0000, etc.
+    return "FF0000" in rgb
 
 def _clear_red_text(ws):
-    """
-    Clears ONLY cells that have red font AND contain text.
-    Keeps layout/formatting intact.
-    """
     for row in ws.iter_rows():
         for cell in row:
             if cell.value not in (None, "") and _is_red_font(cell):
@@ -868,10 +855,8 @@ def build_hud_excel_bytes_from_template(ctx: dict) -> bytes:
     wb = load_workbook(TEMPLATE_PATH)
     ws = wb[TEMPLATE_SHEET] if TEMPLATE_SHEET in wb.sheetnames else wb.active
 
-    # Clear red instruction text
     _clear_red_text(ws)
 
-    # Write values into mapped cells
     def write_cell(key, value):
         addr = CELL_MAP.get(key)
         if not addr:
@@ -884,7 +869,6 @@ def build_hud_excel_bytes_from_template(ctx: dict) -> bytes:
     write_cell("borrower_disp", str(ctx.get("borrower_disp", "")))
     write_cell("address_disp", str(ctx.get("address_disp", "")))
 
-    # Money fields
     write_cell("total_loan_amount", float(ctx.get("total_loan_amount", 0.0)))
     write_cell("initial_advance", float(ctx.get("initial_advance", 0.0)))
     write_cell("total_reno_drawn", float(ctx.get("total_reno_drawn", 0.0)))
@@ -896,7 +880,6 @@ def build_hud_excel_bytes_from_template(ctx: dict) -> bytes:
     write_cell("construction_mgmt_fee", float(ctx.get("construction_mgmt_fee", 0.0)))
     write_cell("title_fee", float(ctx.get("title_fee", 0.0)))
 
-    # (Optional) ensure key fields are black text
     black = Font(color="FF000000")
     for addr in set(CELL_MAP.values()):
         try:
@@ -953,7 +936,7 @@ c1, c2 = st.columns([2.4, 1.2])
 with c1:
     deal_input = st.text_input("Deal Number", key="deal_number_input", placeholder="Type the deal number")
 with c2:
-    run_btn = st.button("Run required checks", type="primary", use_container_width=True)
+    run_btn = st.button("Run checks", type="primary", use_container_width=True)
 st.markdown("</div>", unsafe_allow_html=True)
 
 if run_btn:
@@ -973,7 +956,7 @@ if run_btn:
         prop = fetch_property_for_deal(opp_id) if opp_id else None
         loan = fetch_loan_for_deal(opp_id) if opp_id else None
 
-    with st.spinner("Running required checks..."):
+    with st.spinner("Running checks..."):
         payload = run_prechecks(opp, prop, loan, deal_input)
 
     st.session_state.precheck_payload = {"opp": opp, "payload": payload}
@@ -986,7 +969,7 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload:
     opp = st.session_state.precheck_payload["opp"]
     payload = st.session_state.precheck_payload["payload"]
 
-    st.subheader("Required check results")
+    st.subheader("Check results")
     st.markdown(
         f"""
 <div class="soft-card">
@@ -1007,32 +990,34 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload:
     st.markdown("### Address comparison")
     a1, a2, a3 = st.columns(3)
     with a1:
-        st.markdown("**Address from our system (auto-fill)**")
+        st.markdown("**Address from our system**")
         st.code(payload.get("sf_address") or "(blank)")
     with a2:
-        st.markdown("**Insurance record address**")
+        st.markdown("**Insurance record address (used on HUD)**")
         st.code(payload.get("osc_address") or "(blank)")
     with a3:
-        st.markdown("**Payment record address**")
+        st.markdown("**Payment record address (optional)**")
         st.code(payload.get("caf_address") or "(blank)")
         st.caption(f"How it matched: {payload.get('caf_method') or '(not matched)'}")
 
     if payload["overall_ok"]:
-        st.success("✅ All required checks passed. You can continue to build the HUD.")
+        st.success("✅ Required checks passed. You can continue to build the HUD.")
         st.session_state.allow_override = True
     else:
         st.error("🚫 Required checks did not pass — HUD should NOT be created yet.")
         st.session_state.allow_override = st.checkbox("Override and continue anyway", value=False)
 
 # -----------------------------
-# HUD INPUTS (ONLY AFTER CHECKS)
+# HUD INPUTS (ONLY AFTER REQUIRED CHECKS)
 # -----------------------------
 if st.session_state.precheck_ran and st.session_state.precheck_payload and st.session_state.allow_override:
     opp = st.session_state.precheck_payload["opp"]
     payload = st.session_state.precheck_payload["payload"]
 
     borrower_disp = (opp.get("Account_Name__c") or "").strip().upper()
-    address_disp = payload.get("sf_address") or ""
+
+    # OLD LOGIC: Address defaults to OSC address when available
+    address_disp = payload.get("hud_address_disp") or ""
 
     st.subheader("HUD inputs")
     st.caption("Type amounts like `1200` or `$1,200` (leave blank for $0). Dates are mm/dd/yyyy.")
@@ -1086,7 +1071,7 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload and st.se
             "total_reno_drawn": float(sf_total_reno),
             "interest_reserve": float(sf_interest_reserve),
             "advance_amount": float(advance_amount),
-            "holdback_pct": hb,  # not currently written to template, but kept for future use
+            "holdback_pct": hb,
             "advance_date": adv_date.strftime("%m/%d/%Y"),
             "borrower_disp": (borrower_val or "").strip().upper(),
             "address_disp": (addr_val or "").strip().upper(),
