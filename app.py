@@ -1,12 +1,14 @@
 # ============================================================
-# HUD Generator App — ONE CELL (Streamlit) — CAF MATCH FIX (ORDER ID + SMART ADDRESS)
-#
-# Beginner-friendly changes:
-# ✅ CAF tries deal-id match first; then smart address match (order-insensitive)
-# ✅ Address auto-fill is still from your system (Full address field)
-# ✅ OSC uses Servicer ID match and shows insurance status
-# ✅ Notes avoid jargon (no object/column names shown)
-# ✅ Dates displayed as mm/dd/yyyy
+# HUD Generator App — ONE FILE (Streamlit)
+# - Salesforce OAuth (Auth Code + PKCE)
+# - Required prechecks:
+#     ✅ CAF: try Deal-ID match first (Order Id prefix), then smart address match (order-insensitive)
+#     ✅ OSC: match by Servicer ID and show insurance status
+# - Beginner-friendly UI language (no object/column jargon shown)
+# - Dates displayed as mm/dd/yyyy
+# - HUD output writes INTO your Excel TEMPLATE (from your GitHub repo)
+#     ✅ Uses template file: assets/HUD TEMPLATE.xlsx
+#     ✅ Clears "red instruction text" from template before saving
 # ============================================================
 
 import base64
@@ -23,8 +25,8 @@ import pandas as pd
 import requests
 import streamlit as st
 from simple_salesforce import Salesforce
-from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment
+from openpyxl import load_workbook
+from openpyxl.styles import Font
 
 # -----------------------------
 # PAGE + STYLE
@@ -67,7 +69,39 @@ if "debug_last_sf_error" not in st.session_state:
     st.session_state.debug_last_sf_error = None
 
 # -----------------------------
-# SECRETS
+# TEMPLATE SETTINGS (GitHub repo)
+# -----------------------------
+# Put your template here in your repo:
+#   assets/HUD TEMPLATE.xlsx
+TEMPLATE_PATH = Path(__file__).parent / "assets" / "HUD TEMPLATE.xlsx"
+TEMPLATE_SHEET = "TL-15255"  # change if your tab name differs
+
+# Cell mapping for your template (based on the template you shared)
+CELL_MAP = {
+    # Top summary
+    "total_loan_amount": "D7",
+    "initial_advance": "D8",
+    "total_reno_drawn": "D9",
+    "advance_amount": "D10",
+    "interest_reserve": "D11",
+
+    # Identifiers / dates
+    "deal_number": "G7",      # merged G7:I7 in template, write to G7
+    "advance_date": "G13",
+
+    # Borrower / Address
+    "borrower_disp": "D14",
+    "address_disp": "D15",
+
+    # Fee inputs (merged H:I — write to H cell)
+    "inspection_fee": "H21",
+    "wire_fee": "H22",
+    "construction_mgmt_fee": "H23",
+    "title_fee": "H24",
+}
+
+# -----------------------------
+# SECRETS (Streamlit secrets.toml)
 # -----------------------------
 cfg = st.secrets["salesforce"]
 CLIENT_ID = cfg["client_id"]
@@ -514,7 +548,6 @@ def fetch_property_for_deal(opp_id: str):
     if not lk:
         return None
 
-    # You confirmed these exist/are useful
     prop_fields = ["Id", "Name", lk, "Servicer_Id__c", "Full_Address__c", "Late_Fees_Servicer__c"]
     where = f"{lk} = {soql_quote(opp_id)}"
 
@@ -600,7 +633,6 @@ def caf_try_match_by_address(sf_addr: str, osc_addr: str):
     if "property_address" not in caf_df.columns:
         return {"found": False, "error": "Payment file is missing property addresses.", "row": None, "method": "address"}
 
-    # Prefer SF address for matching; fallback to OSC address
     target = normalize_text(sf_addr) or normalize_text(osc_addr)
     if not target:
         return {"found": False, "error": "No address available to match.", "row": None, "method": "address"}
@@ -610,7 +642,6 @@ def caf_try_match_by_address(sf_addr: str, osc_addr: str):
     target_tokens = address_tokens(target)
 
     caf_addr_raw = caf_df["property_address"].astype(str).fillna("")
-    # fast filters first (zip/house), then similarity score
     candidates = caf_df.copy()
     candidates["_addr_raw"] = caf_addr_raw
 
@@ -621,12 +652,10 @@ def caf_try_match_by_address(sf_addr: str, osc_addr: str):
         candidates["_house"] = candidates["_addr_raw"].map(house_num_from_addr)
         candidates = candidates[candidates["_house"] == target_house]
 
-    # If filtering makes it empty, fall back to full set (still score-based)
     if candidates.empty:
         candidates = caf_df.copy()
         candidates["_addr_raw"] = caf_addr_raw
 
-    # score by token similarity
     scores = []
     for idx, row in candidates.iterrows():
         toks = address_tokens(row["_addr_raw"])
@@ -638,7 +667,6 @@ def caf_try_match_by_address(sf_addr: str, osc_addr: str):
 
     best_idx, best_score = max(scores, key=lambda t: t[1])
 
-    # threshold tuned to accept “same place but formatted differently”
     if best_score < 0.45:
         return {"found": False, "error": "No close address match found.", "row": None, "method": "address"}
 
@@ -691,7 +719,7 @@ def run_prechecks(opp: dict, prop: dict, loan: dict, user_deal_input: str):
     sf_full_address = normalize_text(prop.get("Full_Address__c")) if prop else ""
     sf_full_address_disp = sf_full_address.upper() if sf_full_address else ""
 
-    # OSC
+    # OSC (insurance)
     osc = osc_lookup(servicer_key)
     osc_primary = ""
     osc_ok = False
@@ -700,7 +728,6 @@ def run_prechecks(opp: dict, prop: dict, loan: dict, user_deal_input: str):
         r = osc["row"] or {}
         osc_primary = normalize_text(r.get("primary_status"))
         osc_ok = (osc_primary.strip().lower() == TARGET_INSURANCE_OK)
-        # build an OSC address if available (optional)
         osc_addr_disp = " ".join([
             normalize_text(r.get("property_street")),
             normalize_text(r.get("property_city")),
@@ -708,7 +735,7 @@ def run_prechecks(opp: dict, prop: dict, loan: dict, user_deal_input: str):
             normalize_text(r.get("property_zip")),
         ]).strip().upper()
 
-    # CAF: deal-id first, then address similarity (order-insensitive)
+    # CAF (payments): deal-id first, then address similarity
     caf = caf_try_match_by_deal_id(deal_digits)
     if not caf.get("found"):
         caf = caf_try_match_by_address(sf_full_address, osc_addr_disp)
@@ -790,7 +817,6 @@ def run_prechecks(opp: dict, prop: dict, loan: dict, user_deal_input: str):
                 "Note": "Payment record found, but statuses were not present."
             })
 
-    # overall: strict
     overall_ok = bool(servicer_key) and osc_ok and caf.get("found") and bool(caf_statuses) and caf_ok
 
     return {
@@ -801,7 +827,6 @@ def run_prechecks(opp: dict, prop: dict, loan: dict, user_deal_input: str):
         "total_loan_amount": total_loan_amount,
         "checks": checks,
         "overall_ok": overall_ok,
-        # Debug display (still user-friendly)
         "sf_address": sf_full_address_disp,
         "osc_address": osc_addr_disp,
         "caf_address": caf_addr_disp,
@@ -809,102 +834,75 @@ def run_prechecks(opp: dict, prop: dict, loan: dict, user_deal_input: str):
     }
 
 # -----------------------------
-# EXCEL BUILDER
+# EXCEL TEMPLATE OUTPUT (NO RED INSTRUCTIONS)
 # -----------------------------
-def recompute_ctx(ctx: dict) -> dict:
-    ctx = dict(ctx)
-    ctx["allocated_loan_amount"] = float(ctx["advance_amount"]) + float(ctx["total_reno_drawn"])
-    ctx["construction_advance_amount"] = float(ctx["advance_amount"])
-    ctx["total_fees"] = float(ctx["inspection_fee"]) + float(ctx["wire_fee"]) + float(ctx["construction_mgmt_fee"]) + float(ctx["title_fee"])
-    ctx["net_amount_to_borrower"] = float(ctx["construction_advance_amount"]) - float(ctx["total_fees"])
-    ctx["available_balance"] = (
-        float(ctx["total_loan_amount"])
-        - float(ctx["initial_advance"])
-        - float(ctx["total_reno_drawn"])
-        - float(ctx["advance_amount"])
-        - float(ctx["interest_reserve"])
-    )
-    return ctx
+def _is_red_font(cell) -> bool:
+    """
+    Detects “red writing” based on font color.
+    Common Excel red is RGB like FFFF0000 or FF0000.
+    """
+    c = getattr(getattr(cell, "font", None), "color", None)
+    rgb = getattr(c, "rgb", None)
+    if not rgb:
+        return False
+    rgb = str(rgb).upper()
+    return "FF0000" in rgb  # catches FFFF0000, etc.
 
-def build_hud_excel_bytes(ctx: dict) -> bytes:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "HUD"
-
-    ws.column_dimensions["A"].width = 34
-    ws.column_dimensions["B"].width = 24
-    ws.column_dimensions["C"].width = 34
-    ws.column_dimensions["D"].width = 24
-
-    ws["A1"] = "COREVEST AMERICAN FINANCE LENDER LLC"
-    ws["A2"] = "4 Park Plaza, Suite 900, Irvine, CA 92614"
-    ws["A3"] = "Final Settlement Statement"
-    ws["A1"].font = Font(bold=True, size=14)
-    ws["A3"].font = Font(bold=True, italic=True, size=12)
-
-    rows = [
-        ("Total Loan Amount:", ctx["total_loan_amount"], "Loan ID:", ctx["deal_number"]),
-        ("Initial Advance:", ctx["initial_advance"], "Holdback %:", ctx["holdback_pct"]),
-        ("Total Reno Drawn:", ctx["total_reno_drawn"], "Allocated Loan Amount:", None),
-        ("Advance Amount:", ctx["advance_amount"], "Net Amount to Borrower:", None),
-        ("Interest Reserve:", ctx["interest_reserve"], "", ""),
-        ("Available Balance:", None, "Advance Date:", ctx["advance_date"]),  # mm/dd/yyyy string
-    ]
-    start = 5
-    for i, (l1, v1, l2, v2) in enumerate(rows):
-        r = start + i
-        ws[f"A{r}"] = l1
-        ws[f"C{r}"] = l2
-        ws[f"A{r}"].font = Font(bold=True)
-        if l2:
-            ws[f"C{r}"].font = Font(bold=True)
-
-        if isinstance(v1, (int, float)):
-            ws[f"B{r}"] = float(v1)
-            ws[f"B{r}"].number_format = "$#,##0.00"
-        else:
-            ws[f"B{r}"] = v1 if v1 is not None else ""
-
-        if isinstance(v2, (int, float)):
-            ws[f"D{r}"] = float(v2)
-            ws[f"D{r}"].number_format = "$#,##0.00"
-        else:
-            ws[f"D{r}"] = v2 if v2 is not None else ""
-
-    ws[f"A{start+7}"] = "Borrower:"
-    ws[f"A{start+8}"] = "Address:"
-    ws[f"A{start+7}"].font = Font(bold=True)
-    ws[f"A{start+8}"].font = Font(bold=True)
-    ws[f"B{start+7}"] = ctx["borrower_disp"]
-    ws[f"B{start+8}"] = ctx["address_disp"]
-
-    t = start + 10
-    ws[f"A{t}"] = "Charge Description"
-    ws[f"B{t}"] = "Amount"
-    ws[f"A{t}"].font = Font(bold=True)
-    ws[f"B{t}"].font = Font(bold=True)
-
-    charges = [
-        ("Construction Advance Amount", ctx["construction_advance_amount"]),
-        ("3rd party Inspection Fee", ctx["inspection_fee"]),
-        ("Wire Fee", ctx["wire_fee"]),
-        ("Construction Management Fee", ctx["construction_mgmt_fee"]),
-        ("Title Fee", ctx["title_fee"]),
-        ("Total Fees", ctx["total_fees"]),
-        ("Reimbursement to Borrower", ctx["net_amount_to_borrower"]),
-    ]
-    for i, (desc, amt) in enumerate(charges, start=1):
-        r = t + i
-        ws[f"A{r}"] = desc
-        ws[f"B{r}"] = float(amt)
-        ws[f"B{r}"].number_format = "$#,##0.00"
-        if desc in ("Construction Advance Amount", "Total Fees", "Reimbursement to Borrower"):
-            ws[f"A{r}"].font = Font(bold=True)
-            ws[f"B{r}"].font = Font(bold=True)
-
-    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=4):
+def _clear_red_text(ws):
+    """
+    Clears ONLY cells that have red font AND contain text.
+    Keeps layout/formatting intact.
+    """
+    for row in ws.iter_rows():
         for cell in row:
-            cell.alignment = Alignment(vertical="center")
+            if cell.value not in (None, "") and _is_red_font(cell):
+                cell.value = None
+
+def build_hud_excel_bytes_from_template(ctx: dict) -> bytes:
+    if not TEMPLATE_PATH.exists():
+        raise FileNotFoundError(
+            f"Template not found at: {TEMPLATE_PATH}\n"
+            "Make sure you added it to your GitHub repo at assets/HUD TEMPLATE.xlsx"
+        )
+
+    wb = load_workbook(TEMPLATE_PATH)
+    ws = wb[TEMPLATE_SHEET] if TEMPLATE_SHEET in wb.sheetnames else wb.active
+
+    # Clear red instruction text
+    _clear_red_text(ws)
+
+    # Write values into mapped cells
+    def write_cell(key, value):
+        addr = CELL_MAP.get(key)
+        if not addr:
+            return
+        ws[addr] = value
+
+    write_cell("deal_number", str(ctx.get("deal_number", "")))
+    write_cell("advance_date", str(ctx.get("advance_date", "")))
+
+    write_cell("borrower_disp", str(ctx.get("borrower_disp", "")))
+    write_cell("address_disp", str(ctx.get("address_disp", "")))
+
+    # Money fields
+    write_cell("total_loan_amount", float(ctx.get("total_loan_amount", 0.0)))
+    write_cell("initial_advance", float(ctx.get("initial_advance", 0.0)))
+    write_cell("total_reno_drawn", float(ctx.get("total_reno_drawn", 0.0)))
+    write_cell("advance_amount", float(ctx.get("advance_amount", 0.0)))
+    write_cell("interest_reserve", float(ctx.get("interest_reserve", 0.0)))
+
+    write_cell("inspection_fee", float(ctx.get("inspection_fee", 0.0)))
+    write_cell("wire_fee", float(ctx.get("wire_fee", 0.0)))
+    write_cell("construction_mgmt_fee", float(ctx.get("construction_mgmt_fee", 0.0)))
+    write_cell("title_fee", float(ctx.get("title_fee", 0.0)))
+
+    # (Optional) ensure key fields are black text
+    black = Font(color="FF000000")
+    for addr in set(CELL_MAP.values()):
+        try:
+            ws[addr].font = ws[addr].font.copy(color=black.color)
+        except Exception:
+            pass
 
     out = io.BytesIO()
     wb.save(out)
@@ -940,6 +938,8 @@ with st.expander("Troubleshooting (optional)", expanded=False):
     st.write("Payment file:", caf_path_used, "✅" if caf_err is None else "❌")
     if caf_err:
         st.code(caf_err)
+    st.write("HUD template:", str(TEMPLATE_PATH), "✅" if TEMPLATE_PATH.exists() else "❌")
+    st.caption("If the template shows ❌ on Streamlit Cloud, it is not in your repo (or path/name differs).")
     if st.session_state.debug_last_sf_error:
         st.markdown("Salesforce error details:")
         st.code(st.session_state.debug_last_sf_error.get("soql", ""))
@@ -1086,8 +1086,8 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload and st.se
             "total_reno_drawn": float(sf_total_reno),
             "interest_reserve": float(sf_interest_reserve),
             "advance_amount": float(advance_amount),
-            "holdback_pct": hb,
-            "advance_date": adv_date.strftime("%m/%d/%Y"),  # mm/dd/yyyy
+            "holdback_pct": hb,  # not currently written to template, but kept for future use
+            "advance_date": adv_date.strftime("%m/%d/%Y"),
             "borrower_disp": (borrower_val or "").strip().upper(),
             "address_disp": (addr_val or "").strip().upper(),
             "inspection_fee": float(inspection_fee),
@@ -1095,7 +1095,6 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload and st.se
             "construction_mgmt_fee": float(construction_mgmt_fee),
             "title_fee": float(title_fee),
         }
-        ctx = recompute_ctx(ctx)
 
         st.markdown("### Preview")
         prev = pd.DataFrame(
@@ -1105,17 +1104,23 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload and st.se
                 ["Total Reno Drawn", fmt_money(ctx["total_reno_drawn"])],
                 ["Interest Reserve", fmt_money(ctx["interest_reserve"])],
                 ["Advance Amount", fmt_money(ctx["advance_amount"])],
-                ["Allocated Loan Amount", fmt_money(ctx["allocated_loan_amount"])],
-                ["Total Fees", fmt_money(ctx["total_fees"])],
-                ["Net Amount to Borrower", fmt_money(ctx["net_amount_to_borrower"])],
-                ["Available Balance", fmt_money(ctx["available_balance"])],
                 ["Advance Date", ctx["advance_date"]],
+                ["Inspection Fee", fmt_money(ctx["inspection_fee"])],
+                ["Wire Fee", fmt_money(ctx["wire_fee"])],
+                ["Construction Management Fee", fmt_money(ctx["construction_mgmt_fee"])],
+                ["Title Fee", fmt_money(ctx["title_fee"])],
             ],
             columns=["Field", "Value"],
         )
         st.dataframe(prev, use_container_width=True, hide_index=True)
 
-        xbytes = build_hud_excel_bytes(ctx)
+        try:
+            xbytes = build_hud_excel_bytes_from_template(ctx)
+        except Exception as e:
+            st.error("Could not build the HUD from the template.")
+            st.code(str(e))
+            st.stop()
+
         out_name = f"HUD_{re.sub(r'[^0-9A-Za-z_-]+','_', ctx['deal_number'] or 'Deal')}.xlsx"
         st.download_button(
             "Download HUD Excel",
