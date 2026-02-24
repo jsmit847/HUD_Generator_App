@@ -1,20 +1,13 @@
 # ============================================================
 # HUD Generator App — ONE FILE (Streamlit)
-# - Salesforce OAuth (Auth Code + PKCE)
-# - Prechecks aligned to your OLD logic (minus FCI):
-#     ✅ OSC is REQUIRED + BLOCKING:
-#         - match by Servicer ID (OSC Account Number)
-#         - must be "Outside Policy In-Force"
-#         - HUD address auto-fills from OSC address pieces
-#     ✅ CAF is OPTIONAL (best-effort, DOES NOT BLOCK):
-#         - try Deal-ID match first (Order Id prefix)
-#         - then smart address match (order-insensitive)
-#         - show installment statuses if found
-# - Beginner-friendly UI language (no object/column jargon shown)
-# - Dates displayed as mm/dd/yyyy
-# - HUD output writes INTO your Excel TEMPLATE (from your GitHub repo)
-#     ✅ Uses template file: assets/HUD TEMPLATE.xlsx
-#     ✅ Clears "red instruction text" from template before saving
+# Key SF fixes you asked for:
+# ✅ Uses Property__c as source of: Borrower Name, Full Address, Yardi ID, Interest Allocation,
+#    Initial Disbursement Funded (your org calls it Initial_Disbursement_Used__c),
+#    Holdback_To_Rehab_Ratio__c
+# ✅ Uses Advance__c as source of Loan Commitment (LOC_Commitment__c)
+# ✅ Writes Yardi ID into the "Loan ID" cell (G7) instead of Deal #
+# ✅ Keeps OSC/CAF logic intact (per your old logic)
+# ✅ Still writes into the Excel TEMPLATE (not building a new workbook)
 # ============================================================
 
 import base64
@@ -75,20 +68,15 @@ if "debug_last_sf_error" not in st.session_state:
     st.session_state.debug_last_sf_error = None
 
 # -----------------------------
-# TEMPLATE SETTINGS (GitHub repo)
+# TEMPLATE SETTINGS
 # -----------------------------
-# -----------------------------
-# TEMPLATE SETTINGS (GitHub repo)
-# -----------------------------
-from pathlib import Path
-
 APP_DIR = Path(__file__).resolve().parent
-
-# Your repo has the template in the same folder as app.py (repo root)
 TEMPLATE_PATH = APP_DIR / "HUD TEMPLATE.xlsx"
-
-# If your sheet name differs, update it here
 TEMPLATE_SHEET = "TL-15255"
+
+# NOTE:
+# - In your template, the field labeled "Loan ID" should be Yardi ID (NOT Deal #).
+# - That cell is currently G7, so we map Yardi ID to G7.
 CELL_MAP = {
     "total_loan_amount": "D7",
     "initial_advance": "D8",
@@ -96,7 +84,7 @@ CELL_MAP = {
     "advance_amount": "D10",
     "interest_reserve": "D11",
 
-    "deal_number": "G7",
+    "yardi_id": "G7",         # ✅ Loan ID cell gets Yardi ID
     "advance_date": "G13",
 
     "borrower_disp": "D14",
@@ -182,12 +170,6 @@ def parse_money(val) -> float:
     except Exception:
         return 0.0
 
-def fmt_money(x) -> str:
-    try:
-        return f"${float(x):,.2f}"
-    except Exception:
-        return "$0.00"
-
 def parse_date_any(x):
     if x in ("", None):
         return None
@@ -195,6 +177,12 @@ def parse_date_any(x):
     if pd.isna(dt):
         return None
     return dt.date()
+
+def fmt_money(x) -> str:
+    try:
+        return f"${float(x):,.2f}"
+    except Exception:
+        return "$0.00"
 
 def fmt_date_mmddyyyy(x) -> str:
     d = parse_date_any(x)
@@ -222,7 +210,6 @@ def strip_zip4(s: str) -> str:
         return ""
     return re.sub(r"(\b\d{5})-\d{4}\b", r"\1", str(s))
 
-# --- smart address normalization (order-insensitive) ---
 DIR_MAP = {
     "north": "n", "n": "n",
     "south": "s", "s": "s",
@@ -519,14 +506,13 @@ def fetch_opportunity_by_deal_number(deal_number: str):
     opp_fields = [
         "Id", "Name", "Deal_Loan_Number__c", "Account_Name__c",
         "StageName", "CloseDate",
-        "LOC_Commitment__c", "Amount",
         "Servicer_Commitment_Id__c",
         "Servicer_Status__c",
         "Next_Payment_Date__c",
         "Late_Fees_Servicer__c",
-        "Initial_Disbursement_Funded__c",
+        # keep these as fallbacks if needed:
+        "LOC_Commitment__c", "Amount",
         "Renovation_HB_Funded__c",
-        "Interest_Allocation_Funded__c",
     ]
     where = (
         "("
@@ -546,7 +532,18 @@ def fetch_property_for_deal(opp_id: str):
     if not lk:
         return None
 
-    prop_fields = ["Id", "Name", lk, "Servicer_Id__c", "Full_Address__c", "Late_Fees_Servicer__c"]
+    # ✅ Your confirmed fields live on Property__c
+    prop_fields = [
+        "Id", "Name", lk,
+        "Servicer_Id__c",
+        "Full_Address__c",
+        "Borrower_Name__c",
+        "Yardi_Id__c",
+        "Interest_Allocation__c",
+        "Initial_Disbursement_Used__c",
+        "Holdback_To_Rehab_Ratio__c",
+        "Late_Fees_Servicer__c",
+    ]
     where = f"{lk} = {soql_quote(opp_id)}"
 
     try:
@@ -574,17 +571,37 @@ def fetch_loan_for_deal(opp_id: str):
     r.pop("attributes", None)
     return r
 
+def fetch_advance_for_deal(opp_id: str):
+    """
+    ✅ Loan Commitment is on Advance__c in your org: Advance__c.LOC_Commitment__c
+    We try common relationship fields that might point back to the deal/opportunity.
+    """
+    lk = choose_first_existing("Advance__c", ["Deal__c", "Opportunity__c", "Deal_Id__c", "OpportunityId", "DealId"])
+    if not lk:
+        return None
+
+    adv_fields = ["Id", "Name", lk, "LOC_Commitment__c"]
+    where = f"{lk} = {soql_quote(opp_id)}"
+
+    try:
+        rows, _used, _soql = try_query_drop_missing(sf, "Advance__c", adv_fields, where, limit=20, order_by="CreatedDate DESC")
+        if not rows:
+            return None
+        # If multiple advances exist, prefer the most recent (CreatedDate DESC if available),
+        # otherwise just take the first returned.
+        r = rows[0].copy()
+        r.pop("attributes", None)
+        return r
+    except Exception:
+        # non-blocking; fallback to Opportunity LOC_Commitment__c/Amount
+        return None
+
 # -----------------------------
 # OFFLINE LOOKUPS (OSC + CAF)
 # -----------------------------
 def osc_lookup(servicer_key: str):
-    """
-    REQUIRED + BLOCKING (like your old app):
-    Must find a match and must be Outside Policy In-Force.
-    """
     if osc_df.empty:
         return {"found": False, "error": "Insurance file did not load.", "row": None}
-
     if "account_number" not in osc_df.columns:
         return {"found": False, "error": "Insurance file is missing the ID field.", "row": None}
 
@@ -599,12 +616,8 @@ def osc_lookup(servicer_key: str):
     return {"found": True, "error": None, "row": hit.iloc[0].to_dict()}
 
 def caf_try_match_by_deal_id(deal_digits: str):
-    """
-    OPTIONAL (like old ICE): best-effort match only.
-    """
     if caf_df.empty:
         return {"found": False, "error": "Payment file did not load.", "row": None, "method": "deal id"}
-
     if "order_id" not in caf_df.columns:
         return {"found": False, "error": "Payment file is missing deal IDs.", "row": None, "method": "deal id"}
 
@@ -622,7 +635,6 @@ def caf_try_match_by_deal_id(deal_digits: str):
 def caf_try_match_by_address(sf_addr: str, osc_addr: str):
     if caf_df.empty:
         return {"found": False, "error": "Payment file did not load.", "row": None, "method": "address"}
-
     if "property_address" not in caf_df.columns:
         return {"found": False, "error": "Payment file is missing property addresses.", "row": None, "method": "address"}
 
@@ -659,11 +671,10 @@ def caf_try_match_by_address(sf_addr: str, osc_addr: str):
         return {"found": False, "error": "No address candidates found.", "row": None, "method": "address"}
 
     best_idx, best_score = max(scores, key=lambda t: t[1])
-
     if best_score < 0.45:
         return {"found": False, "error": "No close address match found.", "row": None, "method": "address"}
 
-    return {"found": True, "error": None, "row": caf_df.loc[best_idx].to_dict(), "method": f"address match"}
+    return {"found": True, "error": None, "row": caf_df.loc[best_idx].to_dict(), "method": "address match"}
 
 def pick_payment_statuses(caf_row: dict):
     out = []
@@ -689,9 +700,6 @@ def is_payment_status_ok(val: str) -> bool:
 
 # -----------------------------
 # PRECHECKS (OLD LOGIC STYLE)
-# - OSC is required and blocks
-# - CAF is optional and never blocks
-# - HUD address auto-fills from OSC (like old app)
 # -----------------------------
 TARGET_INSURANCE_OK = "outside policy in-force"
 
@@ -702,13 +710,13 @@ def run_prechecks(opp: dict, prop: dict, loan: dict, user_deal_input: str):
     deal_name = normalize_text(opp.get("Name"))
     acct_name = normalize_text(opp.get("Account_Name__c"))
 
-    # Servicer ID for insurance lookup
     servicer_key = pick_first(
         prop.get("Servicer_Id__c") if prop else "",
         opp.get("Servicer_Commitment_Id__c"),
         loan.get("Servicer_Loan_Id__c") if loan else "",
     )
 
+    # total loan amount will be pulled later from Advance__c if available; keep an opp fallback here
     total_loan_amount = parse_money(pick_first(opp.get("LOC_Commitment__c"), opp.get("Amount"), 0))
 
     # System address (kept for display only; NOT the default HUD address)
@@ -748,78 +756,29 @@ def run_prechecks(opp: dict, prop: dict, loan: dict, user_deal_input: str):
         if caf_statuses:
             caf_ok = all(is_payment_status_ok(v) for (_k, v) in caf_statuses)
 
-    # REQUIRED results (old behavior):
-    # - OSC must exist and be OK
     osc_blocking_ok = bool(servicer_key) and osc.get("found") and osc_ok
 
     checks = []
-
-    # OSC (blocking)
     if not servicer_key:
-        checks.append({
-            "Check": "Servicer identifier",
-            "Value": "(missing)",
-            "Result": "Stop",
-            "Note": "Missing identifier needed to find the insurance record."
-        })
+        checks.append({"Check": "Servicer identifier","Value": "(missing)","Result": "Stop","Note": "Missing identifier needed to find the insurance record."})
     elif not osc.get("found"):
-        checks.append({
-            "Check": "Insurance status",
-            "Value": osc.get("error", "Not found"),
-            "Result": "Stop",
-            "Note": "We need an insurance record before creating the HUD."
-        })
+        checks.append({"Check": "Insurance status","Value": osc.get("error", "Not found"),"Result": "Stop","Note": "We need an insurance record before creating the HUD."})
     else:
-        checks.append({
-            "Check": "Insurance status",
-            "Value": osc_primary if osc_primary else "(blank)",
-            "Result": "OK" if osc_ok else "Stop",
-            "Note": "Must be outside-policy in-force."
-        })
+        checks.append({"Check": "Insurance status","Value": osc_primary if osc_primary else "(blank)","Result": "OK" if osc_ok else "Stop","Note": "Must be outside-policy in-force."})
 
-    # CAF (optional, does NOT block)
     if caf_found:
-        checks.append({
-            "Check": "Payment info (optional)",
-            "Value": "Found",
-            "Result": "OK" if caf_ok else "Review",
-            "Note": "Shown for visibility; it does not block HUD creation."
-        })
+        checks.append({"Check": "Payment info (optional)","Value": "Found","Result": "OK" if caf_ok else "Review","Note": "Shown for visibility; it does not block HUD creation."})
         if caf_statuses:
             summary = " | ".join([f"{k.replace('_',' ').title()}: {v}" for (k, v) in caf_statuses])
-            checks.append({
-                "Check": "Installment status (optional)",
-                "Value": summary,
-                "Result": "OK" if caf_ok else "Review",
-                "Note": "Review if anything looks late or past due."
-            })
+            checks.append({"Check": "Installment status (optional)","Value": summary,"Result": "OK" if caf_ok else "Review","Note": "Review if anything looks late or past due."})
         else:
-            checks.append({
-                "Check": "Installment status (optional)",
-                "Value": "Not available",
-                "Result": "Review",
-                "Note": "Payment record found, but no statuses were available."
-            })
+            checks.append({"Check": "Installment status (optional)","Value": "Not available","Result": "Review","Note": "Payment record found, but no statuses were available."})
     else:
-        checks.append({
-            "Check": "Payment info (optional)",
-            "Value": caf.get("error", "Not found"),
-            "Result": "Review",
-            "Note": "Not required to create the HUD."
-        })
+        checks.append({"Check": "Payment info (optional)","Value": caf.get("error", "Not found"),"Result": "Review","Note": "Not required to create the HUD."})
 
-    # Address info (what will be used)
-    checks.append({
-        "Check": "HUD address source",
-        "Value": "Insurance record" if osc_addr_disp else "System address",
-        "Result": "OK" if (osc_addr_disp or sf_full_address_disp) else "Review",
-        "Note": "The HUD will use the insurance address when available."
-    })
+    checks.append({"Check": "HUD address source","Value": "Insurance record" if osc_addr_disp else "System address","Result": "OK" if (osc_addr_disp or sf_full_address_disp) else "Review","Note": "The HUD will use the insurance address when available."})
 
-    # OLD STYLE overall gating: ONLY OSC blocks
     overall_ok = bool(osc_blocking_ok)
-
-    # Address auto-fill should follow old behavior: OSC first, fallback to system address
     hud_address_disp = osc_addr_disp or sf_full_address_disp
 
     return {
@@ -838,7 +797,7 @@ def run_prechecks(opp: dict, prop: dict, loan: dict, user_deal_input: str):
     }
 
 # -----------------------------
-# EXCEL TEMPLATE OUTPUT (NO RED INSTRUCTIONS)
+# EXCEL TEMPLATE OUTPUT
 # -----------------------------
 def _is_red_font(cell) -> bool:
     c = getattr(getattr(cell, "font", None), "color", None)
@@ -856,10 +815,7 @@ def _clear_red_text(ws):
 
 def build_hud_excel_bytes_from_template(ctx: dict) -> bytes:
     if not TEMPLATE_PATH.exists():
-        raise FileNotFoundError(
-            f"Template not found at: {TEMPLATE_PATH}\n"
-            "Make sure you added it to your GitHub repo at assets/HUD TEMPLATE.xlsx"
-        )
+        raise FileNotFoundError("HUD template not found. Add it to your repo next to app.py.")
 
     wb = load_workbook(TEMPLATE_PATH)
     ws = wb[TEMPLATE_SHEET] if TEMPLATE_SHEET in wb.sheetnames else wb.active
@@ -872,12 +828,13 @@ def build_hud_excel_bytes_from_template(ctx: dict) -> bytes:
             return
         ws[addr] = value
 
-    write_cell("deal_number", str(ctx.get("deal_number", "")))
-    write_cell("advance_date", str(ctx.get("advance_date", "")))
-
+    # TEXT
+    write_cell("yardi_id", str(ctx.get("yardi_id", "")))                 # ✅ Loan ID = Yardi ID
+    write_cell("advance_date", ctx.get("advance_date") or "")            # date string ok; you can change to real date later
     write_cell("borrower_disp", str(ctx.get("borrower_disp", "")))
     write_cell("address_disp", str(ctx.get("address_disp", "")))
 
+    # NUMBERS
     write_cell("total_loan_amount", float(ctx.get("total_loan_amount", 0.0)))
     write_cell("initial_advance", float(ctx.get("initial_advance", 0.0)))
     write_cell("total_reno_drawn", float(ctx.get("total_reno_drawn", 0.0)))
@@ -921,7 +878,7 @@ ensure_default("inp_construction_mgmt_fee", "")
 ensure_default("inp_title_fee", "")
 
 # -----------------------------
-# Troubleshooting expander (optional)
+# Troubleshooting expander
 # -----------------------------
 with st.expander("Troubleshooting (optional)", expanded=False):
     st.write("Insurance file:", osc_path_used, "✅" if osc_err is None else "❌")
@@ -930,8 +887,7 @@ with st.expander("Troubleshooting (optional)", expanded=False):
     st.write("Payment file:", caf_path_used, "✅" if caf_err is None else "❌")
     if caf_err:
         st.code(caf_err)
-    st.write("HUD template:", str(TEMPLATE_PATH), "✅" if TEMPLATE_PATH.exists() else "❌")
-    st.caption("If the template shows ❌ on Streamlit Cloud, it is not in your repo (or path/name differs).")
+    st.write("HUD template loaded:", "✅" if TEMPLATE_PATH.exists() else "❌")
     if st.session_state.debug_last_sf_error:
         st.markdown("Salesforce error details:")
         st.code(st.session_state.debug_last_sf_error.get("soql", ""))
@@ -961,21 +917,25 @@ if run_btn:
         st.stop()
 
     opp_id = opp.get("Id")
+
     with st.spinner("Pulling related info..."):
         prop = fetch_property_for_deal(opp_id) if opp_id else None
         loan = fetch_loan_for_deal(opp_id) if opp_id else None
+        adv = fetch_advance_for_deal(opp_id) if opp_id else None
 
     with st.spinner("Running checks..."):
         payload = run_prechecks(opp, prop, loan, deal_input)
 
-    st.session_state.precheck_payload = {"opp": opp, "payload": payload}
+    st.session_state.precheck_payload = {"opp": opp, "prop": prop, "loan": loan, "adv": adv, "payload": payload}
     st.session_state.precheck_ran = True
 
 # -----------------------------
-# SHOW CHECK RESULTS + FRIENDLY ADDRESS VIEW
+# SHOW CHECK RESULTS
 # -----------------------------
 if st.session_state.precheck_ran and st.session_state.precheck_payload:
     opp = st.session_state.precheck_payload["opp"]
+    prop = st.session_state.precheck_payload.get("prop")
+    adv = st.session_state.precheck_payload.get("adv")
     payload = st.session_state.precheck_payload["payload"]
 
     st.subheader("Check results")
@@ -985,8 +945,8 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload:
   <div class="big"><b>{payload['deal_number']}</b> — {payload['deal_name']}</div>
   <div class="muted">{payload['account_name']}</div>
   <div style="margin-top:8px;">
-    <span class="pill">Total Loan Amount: <b>{fmt_money(payload['total_loan_amount'])}</b></span>
     <span class="pill">Servicer Identifier: <b>{payload['servicer_key'] if payload['servicer_key'] else '—'}</b></span>
+    <span class="pill">Yardi ID: <b>{(prop or {}).get('Yardi_Id__c','') or '—'}</b></span>
   </div>
 </div>
 """,
@@ -995,19 +955,6 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload:
 
     df_checks = pd.DataFrame(payload["checks"])[["Check", "Value", "Result", "Note"]]
     st.dataframe(df_checks, use_container_width=True, hide_index=True)
-
-    st.markdown("### Address comparison")
-    a1, a2, a3 = st.columns(3)
-    with a1:
-        st.markdown("**Address from our system**")
-        st.code(payload.get("sf_address") or "(blank)")
-    with a2:
-        st.markdown("**Insurance record address (used on HUD)**")
-        st.code(payload.get("osc_address") or "(blank)")
-    with a3:
-        st.markdown("**Payment record address (optional)**")
-        st.code(payload.get("caf_address") or "(blank)")
-        st.caption(f"How it matched: {payload.get('caf_method') or '(not matched)'}")
 
     if payload["overall_ok"]:
         st.success("✅ Required checks passed. You can continue to build the HUD.")
@@ -1021,11 +968,14 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload:
 # -----------------------------
 if st.session_state.precheck_ran and st.session_state.precheck_payload and st.session_state.allow_override:
     opp = st.session_state.precheck_payload["opp"]
+    prop = st.session_state.precheck_payload.get("prop") or {}
+    adv = st.session_state.precheck_payload.get("adv") or {}
     payload = st.session_state.precheck_payload["payload"]
 
-    borrower_disp = (opp.get("Account_Name__c") or "").strip().upper()
+    # ✅ Borrower from Property__c.Borrower_Name__c (fallback to Opportunity Account_Name__c)
+    borrower_disp = (pick_first(prop.get("Borrower_Name__c"), opp.get("Account_Name__c")) or "").strip().upper()
 
-    # OLD LOGIC: Address defaults to OSC address when available
+    # OLD LOGIC: Address defaults to OSC when available, else Property__c.Full_Address__c
     address_disp = payload.get("hud_address_disp") or ""
 
     st.subheader("HUD inputs")
@@ -1069,40 +1019,55 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload and st.se
             except Exception:
                 pass
 
-        sf_initial_advance = parse_money(opp.get("Initial_Disbursement_Funded__c")) if "Initial_Disbursement_Funded__c" in opp else 0.0
-        sf_total_reno = parse_money(opp.get("Renovation_HB_Funded__c")) if "Renovation_HB_Funded__c" in opp else 0.0
-        sf_interest_reserve = parse_money(opp.get("Interest_Allocation_Funded__c")) if "Interest_Allocation_Funded__c" in opp else 0.0
+        # ✅ Your confirmed SF sources:
+        # Initial Disbursement Funded = Property__c.Initial_Disbursement_Used__c
+        sf_initial_advance = parse_money(prop.get("Initial_Disbursement_Used__c"))
+
+        # Interest Allocation = Property__c.Interest_Allocation__c
+        sf_interest_reserve = parse_money(prop.get("Interest_Allocation__c"))
+
+        # Loan Commitment = Advance__c.LOC_Commitment__c (fallback to opp)
+        sf_total_loan_amount = parse_money(pick_first(adv.get("LOC_Commitment__c"), opp.get("LOC_Commitment__c"), opp.get("Amount")))
+
+        # Total Reno Drawn (not in your provided list, so keep your existing Opportunity fallback)
+        sf_total_reno = parse_money(opp.get("Renovation_HB_Funded__c"))
 
         ctx = {
-            "deal_number": payload["deal_number"],
-            "total_loan_amount": float(payload["total_loan_amount"]),
+            # ✅ template Loan ID cell gets Yardi ID
+            "yardi_id": normalize_text(prop.get("Yardi_Id__c")),
+
+            "total_loan_amount": float(sf_total_loan_amount),
             "initial_advance": float(sf_initial_advance),
             "total_reno_drawn": float(sf_total_reno),
             "interest_reserve": float(sf_interest_reserve),
+
             "advance_amount": float(advance_amount),
             "holdback_pct": hb,
             "advance_date": adv_date.strftime("%m/%d/%Y"),
+
             "borrower_disp": (borrower_val or "").strip().upper(),
             "address_disp": (addr_val or "").strip().upper(),
+
             "inspection_fee": float(inspection_fee),
             "wire_fee": float(wire_fee),
             "construction_mgmt_fee": float(construction_mgmt_fee),
             "title_fee": float(title_fee),
+
+            # not written to template yet, but stored for later if you add a cell mapping:
+            "holdback_to_rehab_ratio": normalize_text(prop.get("Holdback_To_Rehab_Ratio__c")),
+            "deal_number_for_filename": payload.get("deal_number",""),
         }
 
         st.markdown("### Preview")
         prev = pd.DataFrame(
             [
-                ["Total Loan Amount", fmt_money(ctx["total_loan_amount"])],
-                ["Initial Advance", fmt_money(ctx["initial_advance"])],
+                ["Yardi ID (Loan ID)", ctx["yardi_id"]],
+                ["Total Loan Amount (Commitment)", fmt_money(ctx["total_loan_amount"])],
+                ["Initial Disbursement Funded", fmt_money(ctx["initial_advance"])],
                 ["Total Reno Drawn", fmt_money(ctx["total_reno_drawn"])],
-                ["Interest Reserve", fmt_money(ctx["interest_reserve"])],
+                ["Interest Allocation", fmt_money(ctx["interest_reserve"])],
                 ["Advance Amount", fmt_money(ctx["advance_amount"])],
                 ["Advance Date", ctx["advance_date"]],
-                ["Inspection Fee", fmt_money(ctx["inspection_fee"])],
-                ["Wire Fee", fmt_money(ctx["wire_fee"])],
-                ["Construction Management Fee", fmt_money(ctx["construction_mgmt_fee"])],
-                ["Title Fee", fmt_money(ctx["title_fee"])],
             ],
             columns=["Field", "Value"],
         )
@@ -1115,7 +1080,7 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload and st.se
             st.code(str(e))
             st.stop()
 
-        out_name = f"HUD_{re.sub(r'[^0-9A-Za-z_-]+','_', ctx['deal_number'] or 'Deal')}.xlsx"
+        out_name = f"HUD_{re.sub(r'[^0-9A-Za-z_-]+','_', ctx['deal_number_for_filename'] or 'Deal')}.xlsx"
         st.download_button(
             "Download HUD Excel",
             data=xbytes,
