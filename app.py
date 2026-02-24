@@ -77,9 +77,18 @@ if "debug_last_sf_error" not in st.session_state:
 # -----------------------------
 # TEMPLATE SETTINGS (GitHub repo)
 # -----------------------------
-TEMPLATE_PATH = Path(__file__).parent / "assets" / "HUD TEMPLATE.xlsx"
-TEMPLATE_SHEET = "TL-15255"  # change if your tab name differs
+# -----------------------------
+# TEMPLATE SETTINGS (GitHub repo)
+# -----------------------------
+from pathlib import Path
 
+APP_DIR = Path(__file__).resolve().parent
+
+# Your repo has the template in the same folder as app.py (repo root)
+TEMPLATE_PATH = APP_DIR / "HUD TEMPLATE.xlsx"
+
+# If your sheet name differs, update it here
+TEMPLATE_SHEET = "TL-15255"
 CELL_MAP = {
     "total_loan_amount": "D7",
     "initial_advance": "D8",
