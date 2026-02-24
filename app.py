@@ -82,8 +82,8 @@ CELL_MAP = {
     "advance_amount": "D10",
     "interest_reserve": "D11",
 
-    "deal_number": "G7",      # ✅ Loan ID cell now = Deal #
-    "advance_date": "G13",
+    "deal_number": "I7",      # ✅ Loan ID cell now = Deal #
+    "advance_date": "I13",
 
     "borrower_disp": "D14",
     "address_disp": "D15",
