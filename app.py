@@ -9,7 +9,11 @@
 # ✅ Total Reno Drawn prefers Property__c.Renovation_Advance_Amount_Used__c, then Advance__c.Renovation_Reserve_Total__c, then Opp Total_Amount_Advances__c (last resort)
 # ✅ Interest Reserve prefers Property__c.Interest_Allocation__c, then Opp Interest_Reserves__c / Current_* fields, then Advance__c Interest reserve totals
 # ✅ Borrower + Address prefer Property__c, then Opportunity/Account fallbacks
-# NOTE: Only writes into your existing Excel TEMPLATE.
+#
+# NEW FIXES ADDED (for "works for me but not for them"):
+# ✅ Describe cache is PER SESSION (no cross-user permission leakage)
+# ✅ Permission/FLS/object access errors return empty results (doesn't crash app)
+# ✅ Loan__c fetch is NON-BLOCKING (permissions won't break checks)
 # ============================================================
 
 import base64
@@ -417,13 +421,13 @@ osc_df, osc_path_used, osc_err = load_osc_excel()
 caf_df, caf_path_used, caf_err = load_caf_excel()
 
 # -----------------------------
-# DESCRIBE CACHES
+# DESCRIBE CACHES (FIXED: PER SESSION)
 # -----------------------------
-@st.cache_resource
-def describe_cache():
-    return {}
-
-DESC = describe_cache()
+# IMPORTANT: st.cache_resource here would be shared across users.
+# We want describe results per user session because permissions differ.
+if "DESC" not in st.session_state:
+    st.session_state.DESC = {}
+DESC = st.session_state.DESC
 
 def get_obj_fields(obj_name: str) -> set:
     if obj_name in DESC:
@@ -453,14 +457,36 @@ def choose_first_existing(obj_name: str, candidates: list):
     return None
 
 # -----------------------------
-# SAFE QUERY
+# SAFE QUERY (FIXED: PERMISSION ERRORS DON'T CRASH)
 # -----------------------------
 def sf_query_all(sf: Salesforce, soql: str):
     return sf.query_all(soql).get("records", [])
 
+def _is_perm_error(msg: str) -> bool:
+    m = (msg or "").lower()
+    needles = [
+        "insufficient", "permission", "not authorized", "not permitted",
+        "invalid_type",  # no access to object (or object doesn't exist for user)
+        "insufficient_access", "insufficient access",
+        "insufficient_privileges",
+        "insufficient_access_on_cross_reference_entity",
+        "entity is not accessible",
+        "field is not accessible",
+        "no access", "access denied",
+    ]
+    return any(n in m for n in needles)
+
 def try_query_drop_missing(sf: Salesforce, obj_name: str, fields, where_clause: str, limit=200, order_by=None):
     fields = list(dict.fromkeys([f for f in fields if f]))
     fields = filter_existing_fields(obj_name, fields)
+
+    # If describe failed or they have no accessible fields, don't crash app
+    if not fields:
+        st.session_state.debug_last_sf_error = {
+            "soql": f"(no accessible fields) FROM {obj_name}",
+            "error": "No accessible fields for this user (object/FLS).",
+        }
+        return [], [], ""
 
     if order_by:
         ob_field = order_by.split()[0].strip()
@@ -480,6 +506,10 @@ def try_query_drop_missing(sf: Salesforce, obj_name: str, fields, where_clause: 
             msg = str(e)
             st.session_state.debug_last_sf_error = {"soql": soql, "error": msg}
 
+            # FIX: Treat permission/FLS/sharing errors as "no rows" instead of crashing
+            if _is_perm_error(msg):
+                return [], fields, soql
+
             if order_by and ("unexpected token" in msg.lower() or "nulls" in msg.lower()):
                 order_by = None
                 continue
@@ -498,7 +528,8 @@ def try_query_drop_missing(sf: Salesforce, obj_name: str, fields, where_clause: 
             if bad and bad in fields:
                 fields.remove(bad)
                 if not fields:
-                    raise RuntimeError("Salesforce query failed and no fields remain.") from e
+                    # FIX: don't crash whole app
+                    return [], [], soql
                 continue
 
             raise RuntimeError("Salesforce query failed.") from e
@@ -606,13 +637,21 @@ def fetch_property_for_deal(opp_id: str):
         return None
 
 def fetch_loan_for_deal(opp_id: str):
+    """
+    FIX: Non-blocking. If user doesn't have Loan__c access/FLS, this returns None.
+    """
     lk = choose_first_existing("Loan__c", ["Deal__c", "Opportunity__c", "Deal_Id__c", "OpportunityId", "DealId"])
     if not lk:
         return None
 
     loan_fields = ["Id", "Name", lk, "Servicer_Loan_Status__c", "Servicer_Loan_Id__c", "Next_Payment_Date__c"]
     where = f"{lk} = {soql_quote(opp_id)}"
-    rows, _used, _soql = try_query_drop_missing(sf, "Loan__c", loan_fields, where, limit=5, order_by="CreatedDate DESC")
+    try:
+        rows, _used, _soql = try_query_drop_missing(sf, "Loan__c", loan_fields, where, limit=5, order_by="CreatedDate DESC")
+    except Exception:
+        # extra safety; should be rare now
+        return None
+
     if not rows:
         return None
     r = rows[0].copy()
@@ -965,9 +1004,14 @@ if run_btn:
 
     opp_id = opp.get("Id")
 
+    # FIX: Loan__c is non-blocking (permissions won't crash whole app)
     with st.spinner("Pulling related info..."):
         prop = fetch_property_for_deal(opp_id) if opp_id else None
-        loan = fetch_loan_for_deal(opp_id) if opp_id else None
+        try:
+            loan = fetch_loan_for_deal(opp_id) if opp_id else None
+        except Exception:
+            loan = None
+            st.warning("⚠️ Could not pull Loan details (permissions). Continuing without Loan__c.")
         advances = fetch_advances_for_deal(opp_id) if opp_id else []
 
     with st.spinner("Running checks..."):
@@ -1079,10 +1123,9 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload and st.se
         # FALLBACK LOGIC USING YOUR FIELD LIST
         # -----------------------------
         # Total Loan Amount (Commitment): Advance__c.LOC_Commitment__c -> Property__c.LOC_Commitment__c -> Opp LOC_Commitment__c -> Opp Amount
-        adv_loc_field = None
         adv_loc_val = None
         for a in advances:
-            adv_loc_field, adv_loc_val = pick_first_nonblank_field(a, ["LOC_Commitment__c"])
+            _f, adv_loc_val = pick_first_nonblank_field(a, ["LOC_Commitment__c"])
             if adv_loc_val is not None:
                 break
         total_loan_amount_val = pick_first(
@@ -1096,10 +1139,9 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload and st.se
         sf_total_loan_amount = parse_money(total_loan_amount_val)
 
         # Initial Advance: Property__c.Initial_Disbursement_Used__c -> Property__c.Initial_Disbursement__c -> Advance__c.Initial_Disbursement_Total__c
-        adv_init_field = None
         adv_init_val = None
         for a in advances:
-            adv_init_field, adv_init_val = pick_first_nonblank_field(a, ["Initial_Disbursement_Total__c"])
+            _f, adv_init_val = pick_first_nonblank_field(a, ["Initial_Disbursement_Total__c"])
             if adv_init_val is not None:
                 break
         initial_advance_val = pick_first(
@@ -1111,10 +1153,9 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload and st.se
         sf_initial_advance = parse_money(initial_advance_val)
 
         # Total Reno Drawn: Property__c.Renovation_Advance_Amount_Used__c -> Advance__c.Renovation_Reserve_Total__c -> Property__c.Approved_Renovation_Holdback__c -> Opp.Total_Amount_Advances__c
-        adv_reno_field = None
         adv_reno_val = None
         for a in advances:
-            adv_reno_field, adv_reno_val = pick_first_nonblank_field(a, ["Renovation_Reserve_Total__c"])
+            _f, adv_reno_val = pick_first_nonblank_field(a, ["Renovation_Reserve_Total__c"])
             if adv_reno_val is not None:
                 break
         total_reno_val = pick_first(
@@ -1126,10 +1167,12 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload and st.se
         sf_total_reno = parse_money(total_reno_val)
 
         # Interest Reserve: Property__c.Interest_Allocation__c -> Opp Interest_Reserves__c -> Opp Current_Interest_Reserves_Remaining__c -> Advance__c Interest_Reserve_Total__c -> Advance__c Total_Interest_Reserves_andStub_Interest__c
-        adv_int_field = None
         adv_int_val = None
         for a in advances:
-            adv_int_field, adv_int_val = pick_first_nonblank_field(a, ["Interest_Reserve_Total__c", "Total_Interest_Reserves_andStub_Interest__c", "Interest_Reserve_Subtotal__c"])
+            _f, adv_int_val = pick_first_nonblank_field(
+                a,
+                ["Interest_Reserve_Total__c", "Total_Interest_Reserves_andStub_Interest__c", "Interest_Reserve_Subtotal__c"],
+            )
             if adv_int_val is not None:
                 break
         interest_reserve_val = pick_first(
@@ -1142,8 +1185,8 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload and st.se
         sf_interest_reserve = parse_money(interest_reserve_val)
 
         # Borrower + Address (prefer Property__c)
-        borrower_final = (borrower_val or "").strip().upper()
-        address_final = (addr_val or "").strip().upper()
+        borrower_final = (st.session_state.get("inp_borrower_disp") or "").strip().upper()
+        address_final = (st.session_state.get("inp_address_disp") or "").strip().upper()
 
         # Deal # (Loan ID cell)
         deal_number_final = normalize_text(opp.get("Deal_Loan_Number__c")) or normalize_text(payload.get("deal_number")) or normalize_text(deal_input)
@@ -1160,7 +1203,7 @@ if st.session_state.precheck_ran and st.session_state.precheck_payload and st.se
 
             "advance_amount": float(advance_amount),
             "holdback_pct": hb,
-            "advance_date": adv_date.strftime("%m/%d/%Y"),
+            "advance_date": st.session_state["inp_advance_date"].strftime("%m/%d/%Y"),
 
             "borrower_disp": borrower_final,
             "address_disp": address_final,
