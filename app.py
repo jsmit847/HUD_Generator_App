@@ -382,7 +382,7 @@ OSC_CANDIDATES = [
 ]
 CAF_CANDIDATES = [
     "Corevest_CAF National 52874_3.9.26.xlsx",
-    Corevest_CAF National 52874_3.9.26.xlsx,
+    "Corevest_CAF National 52874_3.9.26.xlsx",
 ]
 
 def first_existing_path(candidates):
