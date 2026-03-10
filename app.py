@@ -377,12 +377,12 @@ with topc2:
 # LOAD EXCEL CHECK FILES
 # -----------------------------
 OSC_CANDIDATES = [
-    "OSC_Zstatus_COREVEST_2026-02-17_180520.xlsx",
-    "OSC_Zstatus_COREVEST_2026-02-17_180520 (1).xlsx",
+    "OSC_Zstatus_COREVEST_2026-03-03_160312.xlsx",
+    "OSC_Zstatus_COREVEST_2026-03-03_160312.xlsx",
 ]
 CAF_CANDIDATES = [
-    "Corevest_CAF National 52874_2.26.xlsx",
-    Corevest_CAF National 52874_2.26.xlsx,
+    "Corevest_CAF National 52874_3.9.26.xlsx",
+    Corevest_CAF National 52874_3.9.26.xlsx,
 ]
 
 def first_existing_path(candidates):
