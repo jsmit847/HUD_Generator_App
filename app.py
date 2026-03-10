@@ -103,7 +103,7 @@ CELL_MAP = {
 # -----------------------------
 cfg = st.secrets["salesforce"]
 CLIENT_ID = cfg["client_id"]
-AUTH_HOST = cfg.get("auth_host", "https://login.salesforce.com").rstrip("/")
+AUTH_HOST = cfg.get("auth_host", "https://cvest.my.salesforce.com").rstrip("/")
 REDIRECT_URI = cfg["redirect_uri"].rstrip("/")
 CLIENT_SECRET = cfg.get("client_secret")
 AUTH_URL = f"{AUTH_HOST}/services/oauth2/authorize"
