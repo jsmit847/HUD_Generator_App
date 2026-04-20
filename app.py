@@ -456,9 +456,9 @@ def fetch_fci_loan_information_rows(url: str, api_token: str) -> dict:
 # -----------------------------
 # LOAD EXCEL CHECK FILES
 # -----------------------------
-OSC_CANDIDATES = [
-    "OSC_Zstatus_COREVEST_2026-03-24_064223.xlsx",
-    "OSC_Zstatus_COREVEST_2026-03-24_064223.xlsx",
+_CANDIDATES = [
+    "OSC_Zstatus_COREVEST_2026-04-14_202850.xlsx",
+    "OSC_Zstatus_COREVEST_2026-04-14_202850.xlsx,
 ]
 CAF_CANDIDATES = [
     "Corevest_CAF National 52874_3.9.26.xlsx",
