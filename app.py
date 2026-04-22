@@ -19,6 +19,7 @@
 import base64
 import hashlib
 import io
+import json
 import re
 import secrets
 import time
@@ -456,24 +457,34 @@ def fetch_fci_loan_information_rows(url: str, api_token: str) -> dict:
 # -----------------------------
 # LOAD EXCEL CHECK FILES
 # -----------------------------
-_CANDIDATES = [
-    "OSC_Zstatus_COREVEST_2026-04-14_202850.xlsx",
+OSC_CANDIDATES = [
     "OSC_Zstatus_COREVEST_2026-04-14_202850.xlsx",
 ]
 CAF_CANDIDATES = [
     "Corevest_CAF National 52874_3.9.26.xlsx",
-    "Corevest_CAF National 52874_3.9.26.xlsx",
 ]
 
 def first_existing_path(candidates):
-    for c in candidates:
-        p1 = Path(c)
-        if p1.exists():
-            return str(p1)
-        p2 = Path("/mnt/data") / c
-        if p2.exists():
-            return str(p2)
-    return candidates[0]
+    checked = set()
+    search_roots = [Path.cwd(), APP_DIR, Path("/mnt/data")]
+
+    for candidate in candidates:
+        raw_path = Path(candidate)
+        raw_key = str(raw_path.resolve()) if raw_path.is_absolute() and raw_path.exists() else str(raw_path)
+        if raw_key not in checked and raw_path.exists():
+            return str(raw_path)
+        checked.add(raw_key)
+
+        for root in search_roots:
+            probe = root / candidate
+            probe_key = str(probe)
+            if probe_key in checked:
+                continue
+            checked.add(probe_key)
+            if probe.exists():
+                return str(probe)
+
+    return str(APP_DIR / candidates[0])
 
 @st.cache_data(show_spinner=False)
 def load_osc_excel():
