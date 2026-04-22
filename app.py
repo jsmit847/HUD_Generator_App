@@ -459,7 +459,6 @@ def fetch_fci_loan_information_rows(url: str, api_token: str) -> dict:
 # -----------------------------
 OSC_CANDIDATES = [
     "OSC_Zstatus_COREVEST_2026-04-14_202850.xlsx",
-    "OSC_Zstatus_COREVEST_2026-03-24_064223.xlsx",
 ]
 CAF_CANDIDATES = [
     "Corevest_CAF National 52874_3.9.26.xlsx",
@@ -2106,6 +2105,311 @@ def run_construction_checklist_page():
                 st.write("FCI:", normalize_text(fci.get("error")) or "No match found")
     else:
         st.info("Enter a deal number and get the checklist values to populate the list.")
+
+
+def ensure_default(key, val):
+    if key not in st.session_state:
+        st.session_state[key] = val
+
+
+
+def run_hud_generator_page():
+    ensure_default("deal_number_input", "")
+    ensure_default("precheck_ran", False)
+    ensure_default("precheck_payload", None)
+    ensure_default("allow_override", False)
+
+    ensure_default("inp_advance_amount", "")
+    ensure_default("inp_holdback_pct", "")
+    ensure_default("inp_advance_date", date.today())
+    ensure_default("inp_inspection_fee", "")
+    ensure_default("inp_wire_fee", "")
+    ensure_default("inp_construction_mgmt_fee", "")
+    ensure_default("inp_title_fee", "")
+
+    # -----------------------------
+    # Troubleshooting expander
+    # -----------------------------
+    with st.expander("Troubleshooting (optional)", expanded=False):
+        st.write("Insurance file:", osc_path_used, "✅" if osc_err is None else "❌")
+        if osc_err:
+            st.code(osc_err)
+        st.write("Payment file:", caf_path_used, "✅" if caf_err is None else "❌")
+        if caf_err:
+            st.code(caf_err)
+        st.write("HUD template loaded:", "✅" if TEMPLATE_PATH.exists() else "❌")
+        if st.session_state.debug_last_sf_error:
+            st.markdown("Salesforce error details:")
+            st.code(st.session_state.debug_last_sf_error.get("soql", ""))
+            st.code(st.session_state.debug_last_sf_error.get("error", ""))
+
+    # -----------------------------
+    # UI — DEAL INPUT + PRECHECKS
+    # -----------------------------
+    st.markdown('<div class="soft-card">', unsafe_allow_html=True)
+    c1, c2 = st.columns([2.4, 1.2])
+    with c1:
+        deal_input = st.text_input("Deal Number", key="deal_number_input", placeholder="Type the deal number")
+    with c2:
+        run_btn = st.button("Run checks", type="primary", use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if run_btn:
+        st.session_state.precheck_ran = False
+        st.session_state.precheck_payload = None
+        st.session_state.allow_override = False
+
+        with st.spinner("Finding your deal..."):
+            opp = fetch_opportunity_by_deal_number(deal_input)
+
+        if not opp:
+            st.error("No deal found for that number. Double-check the deal number and try again.")
+            st.stop()
+
+        opp_id = opp.get("Id")
+
+        # FIX: Loan__c is non-blocking (permissions won't crash whole app)
+        with st.spinner("Pulling related info..."):
+            prop = fetch_property_for_deal(opp_id) if opp_id else None
+            try:
+                loan = fetch_loan_for_deal(opp_id) if opp_id else None
+            except Exception:
+                loan = None
+                st.warning("⚠️ Could not pull Loan details (permissions). Continuing without Loan__c.")
+            advances = fetch_advances_for_deal(opp_id) if opp_id else []
+
+        with st.spinner("Running checks..."):
+            payload = run_prechecks(opp, prop, loan, deal_input)
+
+        st.session_state.precheck_payload = {"opp": opp, "prop": prop, "loan": loan, "advances": advances, "payload": payload}
+        st.session_state.precheck_ran = True
+
+    # -----------------------------
+    # SHOW CHECK RESULTS + ADDRESS VIEW
+    # -----------------------------
+    if st.session_state.precheck_ran and st.session_state.precheck_payload:
+        opp = st.session_state.precheck_payload["opp"]
+        prop = st.session_state.precheck_payload.get("prop") or {}
+        payload = st.session_state.precheck_payload["payload"]
+
+        st.subheader("Check results")
+        st.markdown(
+            f"""
+    <div class="soft-card">
+      <div class="big"><b>{payload['deal_number']}</b> — {payload['deal_name']}</div>
+      <div class="muted">{payload['account_name']}</div>
+      <div style="margin-top:8px;">
+        <span class="pill">Servicer Identifier: <b>{payload['servicer_key'] if payload['servicer_key'] else '—'}</b></span>
+        <span class="pill">Borrower (SF): <b>{(prop.get('Borrower_Name__c') or '') or '—'}</b></span>
+      </div>
+    </div>
+    """,
+            unsafe_allow_html=True,
+        )
+
+        df_checks = pd.DataFrame(payload["checks"])[["Check", "Value", "Result", "Note"]]
+        st.dataframe(df_checks, use_container_width=True, hide_index=True)
+
+        st.markdown("### Address comparison")
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            st.markdown("**Address from our system**")
+            st.code(payload.get("sf_address") or "(blank)")
+        with a2:
+            st.markdown("**Insurance record address (used on HUD)**")
+            st.code(payload.get("osc_address") or "(blank)")
+        with a3:
+            st.markdown("**Payment record address (optional)**")
+            st.code(payload.get("caf_address") or "(blank)")
+            st.caption(f"How it matched: {payload.get('caf_method') or '(not matched)'}")
+
+        if payload["overall_ok"]:
+            st.success("✅ Required checks passed. You can continue to build the HUD.")
+            st.session_state.allow_override = True
+        else:
+            st.error("🚫 Required checks did not pass — HUD should NOT be created yet.")
+            st.session_state.allow_override = st.checkbox("Override and continue anyway", value=False)
+
+    # -----------------------------
+    # HUD INPUTS (ONLY AFTER REQUIRED CHECKS)
+    # -----------------------------
+    if st.session_state.precheck_ran and st.session_state.precheck_payload and st.session_state.allow_override:
+        opp = st.session_state.precheck_payload["opp"]
+        prop = st.session_state.precheck_payload.get("prop") or {}
+        advances = st.session_state.precheck_payload.get("advances") or []
+        payload = st.session_state.precheck_payload["payload"]
+
+        borrower_default = (pick_first(prop.get("Borrower_Name__c"), opp.get("Account_Name__c")) or "").strip().upper()
+        address_default = payload.get("hud_address_disp") or ""
+
+        st.subheader("HUD inputs")
+        st.caption("Type amounts like `1200` or `$1,200` (leave blank for $0). Dates are mm/dd/yyyy.")
+
+        with st.form("hud_form", clear_on_submit=False):
+            cA, cB, cC = st.columns([1.2, 1.0, 1.2])
+
+            with cA:
+                st.markdown("**Borrower info**")
+                borrower_val = st.text_input("Borrower (for the form)", value=borrower_default, key="inp_borrower_disp")
+                addr_val = st.text_input("Address (for the form)", value=address_default, key="inp_address_disp")
+
+            with cB:
+                st.markdown("**Advance**")
+                adv_amt_raw = st.text_input("Advance Amount", key="inp_advance_amount", placeholder="e.g., 25000")
+                holdback_pct = st.text_input("Holdback % (optional)", key="inp_holdback_pct", placeholder="e.g., 20%")
+                adv_date = st.date_input("Advance Date", key="inp_advance_date")
+
+            with cC:
+                st.markdown("**Fees**")
+                insp_raw = st.text_input("3rd party Inspection Fee", key="inp_inspection_fee", placeholder="leave blank for 0")
+                wire_raw = st.text_input("Wire Fee", key="inp_wire_fee", placeholder="leave blank for 0")
+                cm_raw = st.text_input("Construction Management Fee", key="inp_construction_mgmt_fee", placeholder="leave blank for 0")
+                title_raw = st.text_input("Title Fee", key="inp_title_fee", placeholder="leave blank for 0")
+
+            submitted = st.form_submit_button("Build HUD Excel", type="primary", use_container_width=True)
+
+        if submitted:
+            advance_amount = parse_money(adv_amt_raw)
+            inspection_fee = parse_money(insp_raw)
+            wire_fee = parse_money(wire_raw)
+            construction_mgmt_fee = parse_money(cm_raw)
+            title_fee = parse_money(title_raw)
+
+            hb = (holdback_pct or "").strip()
+            if hb and not hb.endswith("%"):
+                try:
+                    v = float(hb.replace("%", "").strip())
+                    hb = f"{v:.0f}%"
+                except Exception:
+                    pass
+
+            # -----------------------------
+            # FALLBACK LOGIC USING YOUR FIELD LIST
+            # -----------------------------
+            # Total Loan Amount (Commitment): Advance__c.LOC_Commitment__c -> Property__c.LOC_Commitment__c -> Opp LOC_Commitment__c -> Opp Amount
+            adv_loc_val = None
+            for a in advances:
+                _f, adv_loc_val = pick_first_nonblank_field(a, ["LOC_Commitment__c"])
+                if adv_loc_val is not None:
+                    break
+            total_loan_amount_val = pick_first(
+                adv_loc_val,
+                prop.get("LOC_Commitment__c"),
+                opp.get("LOC_Commitment__c"),
+                opp.get("Final_Loan_Amount__c"),
+                opp.get("Current_Loan_Amount__c"),
+                opp.get("Amount"),
+            )
+            sf_total_loan_amount = parse_money(total_loan_amount_val)
+
+            # Initial Advance: Property__c.Initial_Disbursement_Used__c -> Property__c.Initial_Disbursement__c -> Advance__c.Initial_Disbursement_Total__c
+            adv_init_val = None
+            for a in advances:
+                _f, adv_init_val = pick_first_nonblank_field(a, ["Initial_Disbursement_Total__c"])
+                if adv_init_val is not None:
+                    break
+            initial_advance_val = pick_first(
+                prop.get("Initial_Disbursement_Used__c"),
+                prop.get("Initial_Disbursement__c"),
+                prop.get("Total_Initial_Disbursement__c"),
+                adv_init_val,
+            )
+            sf_initial_advance = parse_money(initial_advance_val)
+
+            # Total Reno Drawn: Property__c.Renovation_Advance_Amount_Used__c -> Advance__c.Renovation_Reserve_Total__c -> Property__c.Approved_Renovation_Holdback__c -> Opp.Total_Amount_Advances__c
+            adv_reno_val = None
+            for a in advances:
+                _f, adv_reno_val = pick_first_nonblank_field(a, ["Renovation_Reserve_Total__c"])
+                if adv_reno_val is not None:
+                    break
+            total_reno_val = pick_first(
+                prop.get("Renovation_Advance_Amount_Used__c"),
+                adv_reno_val,
+                prop.get("Approved_Renovation_Holdback__c"),
+                opp.get("Total_Amount_Advances__c"),
+            )
+            sf_total_reno = parse_money(total_reno_val)
+
+            # Interest Reserve: Property__c.Interest_Allocation__c -> Opp Interest_Reserves__c -> Opp Current_Interest_Reserves_Remaining__c -> Advance__c Interest_Reserve_Total__c -> Advance__c Total_Interest_Reserves_andStub_Interest__c
+            adv_int_val = None
+            for a in advances:
+                _f, adv_int_val = pick_first_nonblank_field(
+                    a,
+                    ["Interest_Reserve_Total__c", "Total_Interest_Reserves_andStub_Interest__c", "Interest_Reserve_Subtotal__c"],
+                )
+                if adv_int_val is not None:
+                    break
+            interest_reserve_val = pick_first(
+                prop.get("Interest_Allocation__c"),
+                opp.get("Interest_Reserves__c"),
+                opp.get("Current_Interest_Reserves_Remaining__c"),
+                opp.get("Current_Interest_Reserves_Paid__c"),
+                adv_int_val,
+            )
+            sf_interest_reserve = parse_money(interest_reserve_val)
+
+            # Borrower + Address (prefer Property__c)
+            borrower_final = (st.session_state.get("inp_borrower_disp") or "").strip().upper()
+            address_final = (st.session_state.get("inp_address_disp") or "").strip().upper()
+
+            # Deal # (Loan ID cell)
+            deal_number_final = normalize_text(opp.get("Deal_Loan_Number__c")) or normalize_text(payload.get("deal_number")) or normalize_text(deal_input)
+
+            # -----------------------------
+            # Build ctx
+            # -----------------------------
+            ctx = {
+                "deal_number": deal_number_final,
+                "total_loan_amount": float(sf_total_loan_amount),
+                "initial_advance": float(sf_initial_advance),
+                "total_reno_drawn": float(sf_total_reno),
+                "interest_reserve": float(sf_interest_reserve),
+
+                "advance_amount": float(advance_amount),
+                "holdback_pct": hb,
+                "advance_date": st.session_state["inp_advance_date"].strftime("%m/%d/%Y"),
+
+                "borrower_disp": borrower_final,
+                "address_disp": address_final,
+
+                "inspection_fee": float(inspection_fee),
+                "wire_fee": float(wire_fee),
+                "construction_mgmt_fee": float(construction_mgmt_fee),
+                "title_fee": float(title_fee),
+            }
+
+            # Preview with source transparency (helps you validate fallbacks quickly)
+            st.markdown("### Preview")
+            prev = pd.DataFrame(
+                [
+                    ["Deal # (Loan ID cell)", ctx["deal_number"]],
+                    ["Total Loan Amount", fmt_money(ctx["total_loan_amount"])],
+                    ["Initial Advance", fmt_money(ctx["initial_advance"])],
+                    ["Total Reno Drawn", fmt_money(ctx["total_reno_drawn"])],
+                    ["Interest Reserve", fmt_money(ctx["interest_reserve"])],
+                    ["Advance Amount", fmt_money(ctx["advance_amount"])],
+                    ["Advance Date", ctx["advance_date"]],
+                ],
+                columns=["Field", "Value"],
+            )
+            st.dataframe(prev, use_container_width=True, hide_index=True)
+
+            try:
+                xbytes = build_hud_excel_bytes_from_template(ctx)
+            except Exception as e:
+                st.error("Could not build the HUD from the template.")
+                st.code(str(e))
+                st.stop()
+
+            out_name = f"HUD_{re.sub(r'[^0-9A-Za-z_-]+','_', ctx['deal_number'] or 'Deal')}.xlsx"
+            st.download_button(
+                "Download HUD Excel",
+                data=xbytes,
+                file_name=out_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
 
 
 def run_app():
