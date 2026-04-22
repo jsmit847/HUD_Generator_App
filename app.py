@@ -19,7 +19,6 @@
 import base64
 import hashlib
 import io
-import json
 import re
 import secrets
 import time
@@ -376,115 +375,26 @@ with topc2:
         st.rerun()
 
 # -----------------------------
-# OPTIONAL FCI CONFIG
-# -----------------------------
-FCI_DEFAULT_URL = "https://fapi.myfci.com/graphql"
-FCI_LOAN_INFORMATION_QUERY = """
-query GetLoanInformation {
-  getLoanInformation {
-    poffUnpaidLateCharges
-    lateChargesDays
-    lateChargesPct
-    lenderAccount
-    maturityDate
-    nextDueDate
-    noteRate
-  }
-}
-"""
-
-
-def get_fci_config() -> dict:
-    try:
-        cfg = st.secrets.get("fci", {})
-    except Exception:
-        cfg = {}
-
-    url = normalize_text(cfg.get("url")) if hasattr(cfg, "get") else ""
-    token = normalize_text(cfg.get("api_token")) if hasattr(cfg, "get") else ""
-    return {
-        "enabled": bool(token),
-        "url": url or FCI_DEFAULT_URL,
-        "api_token": token,
-    }
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_fci_loan_information_rows(url: str, api_token: str) -> dict:
-    if not url or not api_token:
-        return {"ok": False, "rows": [], "error": "FCI API token is not configured."}
-
-    headers = {
-        "Authorization": f"Bearer {api_token}",
-        "Content-Type": "application/json",
-    }
-    payload = {"query": FCI_LOAN_INFORMATION_QUERY, "variables": {}}
-
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        result = response.json()
-    except Exception as exc:
-        return {"ok": False, "rows": [], "error": f"FCI request failed: {exc}"}
-
-    if "errors" in result:
-        return {"ok": False, "rows": [], "error": json.dumps(result["errors"], indent=2)}
-
-    records = (result.get("data") or {}).get("getLoanInformation") or []
-    if isinstance(records, dict):
-        records = [records]
-    if not isinstance(records, list):
-        records = []
-
-    cleaned_rows = []
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        cleaned_rows.append(
-            {
-                "poffUnpaidLateCharges": record.get("poffUnpaidLateCharges"),
-                "lateChargesDays": record.get("lateChargesDays"),
-                "lateChargesPct": record.get("lateChargesPct"),
-                "lenderAccount": record.get("lenderAccount"),
-                "maturityDate": record.get("maturityDate"),
-                "nextDueDate": record.get("nextDueDate"),
-                "noteRate": record.get("noteRate"),
-            }
-        )
-
-    return {"ok": True, "rows": cleaned_rows, "error": ""}
-
-# -----------------------------
 # LOAD EXCEL CHECK FILES
 # -----------------------------
 OSC_CANDIDATES = [
-    "OSC_Zstatus_COREVEST_2026-04-14_202850.xlsx",
+    "OSC_Zstatus_COREVEST_2026-03-24_064223.xlsx",
+    "OSC_Zstatus_COREVEST_2026-03-24_064223.xlsx",
 ]
 CAF_CANDIDATES = [
+    "Corevest_CAF National 52874_3.9.26.xlsx",
     "Corevest_CAF National 52874_3.9.26.xlsx",
 ]
 
 def first_existing_path(candidates):
-    checked = set()
-    search_roots = [Path.cwd(), APP_DIR, Path("/mnt/data")]
-
-    for candidate in candidates:
-        raw_path = Path(candidate)
-        raw_key = str(raw_path.resolve()) if raw_path.is_absolute() and raw_path.exists() else str(raw_path)
-        if raw_key not in checked and raw_path.exists():
-            return str(raw_path)
-        checked.add(raw_key)
-
-        for root in search_roots:
-            probe = root / candidate
-            probe_key = str(probe)
-            if probe_key in checked:
-                continue
-            checked.add(probe_key)
-            if probe.exists():
-                return str(probe)
-
-    return str(APP_DIR / candidates[0])
+    for c in candidates:
+        p1 = Path(c)
+        if p1.exists():
+            return str(p1)
+        p2 = Path("/mnt/data") / c
+        if p2.exists():
+            return str(p2)
+    return candidates[0]
 
 @st.cache_data(show_spinner=False)
 def load_osc_excel():
@@ -1055,60 +965,80 @@ CHECKLIST_STATUS_OPTIONS = [
     "Not Applicable",
 ]
 
-CHECKLIST_NOT_FOUND = "Not found"
-
 CHECKLIST_AUTO_ROW_HELP = {
-    2: "Sold loan or cap partner",
-    3: "Next payment due date",
-    4: "Other late payments",
-    5: "Maturity date",
-    6: "Taxes not delinquent",
+    2: "Loan Buyer / Capital Partner",
+    3: "Next payment due",
+    4: "Late payment check",
+    5: "Current maturity date",
+    6: "Taxes check",
     7: "Supplier code",
-    8: "Property insurance current",
+    8: "Property insurance",
+    32: "Remaining value check",
 }
 
 CHECKLIST_EXPORT_SPECS = [
     {
         "order": 1,
-        "field": "sold_loan_or_cap_partner",
-        "label": "NLB (No Loan Balance) or Cap Partner aka Sold loan",
+        "field": "sold_loan_status",
+        "label": "NLB / sold loan status",
         "row_number": 2,
+        "source_hint": "Derived from Opportunity.Intended_Capital_Partner__c and Sold_Loan_Pool__c",
     },
     {
         "order": 2,
-        "field": "next_payment_due",
-        "label": "Next payment due date",
-        "row_number": 3,
+        "field": "loan_buyer_or_cap_partner",
+        "label": "Loan buyer / capital partner",
+        "row_number": 2,
+        "source_hint": "Account name from Opportunity.Intended_Capital_Partner__c or Sold_Loan_Pool__c.Sold_To__c",
     },
     {
         "order": 3,
-        "field": "late_payment_check",
-        "label": "Check FCI to see if borrowing entity is late for any other payments",
-        "row_number": 4,
+        "field": "next_payment_due",
+        "label": "Next payment due",
+        "row_number": 3,
+        "source_hint": "Property__c.Next_Payment_Date__c or Opportunity.Next_Payment_Date__c",
     },
     {
         "order": 4,
-        "field": "maturity_date",
-        "label": "Maturity Date",
-        "row_number": 5,
+        "field": "late_payment_check",
+        "label": "Late payment check",
+        "row_number": 4,
+        "source_hint": "Derived from Servicer_Loan__c delinquency fields",
     },
     {
         "order": 5,
-        "field": "tax_status",
-        "label": "Taxes Not Delinquent",
-        "row_number": 6,
+        "field": "maturity_date",
+        "label": "Current maturity date",
+        "row_number": 5,
+        "source_hint": "Property__c.Updated_Asset_Maturity_Date__c or Opportunity.Updated_Loan_Maturity_Date__c",
     },
     {
         "order": 6,
-        "field": "supplier_code",
-        "label": "Workday Vendor Set Up - Supplier Code",
-        "row_number": 7,
+        "field": "tax_status",
+        "label": "Taxes status",
+        "row_number": 6,
+        "source_hint": "REO__c.Taxes_Status__c with Property__c.Tax_Payment_Next_Due_Date__c support",
     },
     {
         "order": 7,
+        "field": "supplier_code",
+        "label": "Supplier code",
+        "row_number": 7,
+        "source_hint": "Account.Yardi_Vendor_Code__c",
+    },
+    {
+        "order": 8,
         "field": "insurance_status",
-        "label": "Property Insurance Current",
+        "label": "Property insurance",
         "row_number": 8,
+        "source_hint": "Property__c.Insurance_Status__c and Property__c.Insurance_Expiration_Date__c",
+    },
+    {
+        "order": 9,
+        "field": "remaining_value_status",
+        "label": "Remaining value in Salesforce",
+        "row_number": 32,
+        "source_hint": "Derived from Property__c.Outstanding_Facility_Amount__c",
     },
 ]
 
@@ -1208,13 +1138,15 @@ def checklist_answer_from_choice(
 
 def checklist_blank_export_values() -> Dict[str, str]:
     return {
-        "sold_loan_or_cap_partner": CHECKLIST_NOT_FOUND,
-        "next_payment_due": CHECKLIST_NOT_FOUND,
-        "late_payment_check": CHECKLIST_NOT_FOUND,
-        "maturity_date": CHECKLIST_NOT_FOUND,
-        "tax_status": CHECKLIST_NOT_FOUND,
-        "supplier_code": CHECKLIST_NOT_FOUND,
-        "insurance_status": CHECKLIST_NOT_FOUND,
+        "sold_loan_status": "Need review",
+        "loan_buyer_or_cap_partner": "",
+        "next_payment_due": "",
+        "late_payment_check": "Need review",
+        "maturity_date": "",
+        "tax_status": "Need review",
+        "supplier_code": "",
+        "insurance_status": "Need review",
+        "remaining_value_status": "Need review",
     }
 
 
@@ -1274,8 +1206,6 @@ def fetch_checklist_opportunity_by_deal_number(deal_number: str):
         "Next_Payment_Date__c",
         "Construction_Comments__c",
         "CloseDate",
-        "Servicer_Commitment_Id__c",
-        "Warehouse_Line__c",
     ]
     where = (
         "("
@@ -1315,10 +1245,7 @@ def fetch_checklist_properties_for_deal(opp_id: str):
         "REO__c",
         "Sold_Loan_Pool__c",
         "Servicer_Loan__c",
-        "Servicer_Id__c",
         "ConstructionManagementLoanId__c",
-        "Warehouse_Line_New__c",
-        "Warehouse_Line__c",
     ]
     where = f"{lk} = {soql_quote(opp_id)}"
     rows, _used, _soql = try_query_drop_missing(sf, "Property__c", fields, where, limit=25, order_by="CreatedDate DESC")
@@ -1347,7 +1274,6 @@ def fetch_servicer_loans_for_deal(opp_id: str):
         "Delinquent_120_Days__c",
         "First_Payment_Date__c",
         "Last_Payment_Date__c",
-        "Servicer_Commitment_ID__c",
     ]
     where = f"{lk} = {soql_quote(opp_id)}"
     rows, _used, _soql = try_query_drop_missing(sf, "Servicer_Loan__c", fields, where, limit=25, order_by="CreatedDate DESC")
@@ -1409,7 +1335,7 @@ def fetch_reo_for_property(property_id: str):
     return r
 
 
-def fetch_construction_checklist_bundle(deal_number: str, lender_account_override: str = ""):
+def fetch_construction_checklist_bundle(deal_number: str):
     opp = fetch_checklist_opportunity_by_deal_number(deal_number)
     if not opp:
         return None
@@ -1432,7 +1358,7 @@ def fetch_construction_checklist_bundle(deal_number: str, lender_account_overrid
     if primary_property and primary_property.get("Id"):
         reo = fetch_reo_for_property(primary_property.get("Id"))
 
-    bundle = {
+    return {
         "opportunity": opp,
         "account": account,
         "business_entity": business_entity,
@@ -1444,8 +1370,6 @@ def fetch_construction_checklist_bundle(deal_number: str, lender_account_overrid
         "sold_to_account": sold_to_account,
         "reo": reo,
     }
-    bundle["fci"] = fetch_fci_bundle(bundle, lender_account_override)
-    return bundle
 
 
 def _first_nonblank_number(*vals):
@@ -1466,114 +1390,6 @@ def _parse_float(v):
         return float(str(v).replace(',', '').replace('$', '').strip())
     except Exception:
         return None
-
-
-def _fci_key(value: str) -> str:
-    return re.sub(r"[^0-9A-Za-z]", "", normalize_text(value)).upper()
-
-
-def build_fci_candidate_keys(bundle: dict) -> list[dict]:
-    opp = bundle.get("opportunity") or {}
-    prop = bundle.get("primary_property") or {}
-    servicer_loans = bundle.get("servicer_loans") or []
-    candidates: list[dict] = []
-
-    def add(raw_value, label: str):
-        raw_value = normalize_text(raw_value)
-        clean_value = _fci_key(raw_value)
-        if not clean_value:
-            return
-        if any(item["clean"] == clean_value for item in candidates):
-            return
-        candidates.append({"raw": raw_value, "clean": clean_value, "label": label})
-
-    add(prop.get("Servicer_Id__c"), "Property__c.Servicer_Id__c")
-    add(opp.get("Servicer_Commitment_Id__c"), "Opportunity.Servicer_Commitment_Id__c")
-    add(prop.get("ConstructionManagementLoanId__c"), "Property__c.ConstructionManagementLoanId__c")
-
-    for idx, row in enumerate(servicer_loans, start=1):
-        add(row.get("Servicer_Commitment_ID__c"), f"Servicer_Loan__c[{idx}].Servicer_Commitment_ID__c")
-        add(row.get("Name"), f"Servicer_Loan__c[{idx}].Name")
-
-    return candidates
-
-
-def fetch_fci_bundle(bundle: dict, lender_account_override: str = "") -> dict:
-    cfg = get_fci_config()
-    out = {
-        "enabled": cfg.get("enabled", False),
-        "matched": False,
-        "match_source": "",
-        "record": None,
-        "candidate_keys": build_fci_candidate_keys(bundle),
-        "rows_found": 0,
-        "error": "",
-    }
-
-    if not cfg.get("enabled"):
-        out["error"] = "FCI is not configured in Streamlit secrets."
-        return out
-
-    fetch_result = fetch_fci_loan_information_rows(cfg["url"], cfg["api_token"])
-    rows = fetch_result.get("rows") or []
-    out["rows_found"] = len(rows)
-
-    if not fetch_result.get("ok"):
-        out["error"] = fetch_result.get("error") or "FCI request failed."
-        return out
-
-    rows_by_key: dict[str, list[dict]] = {}
-    for row in rows:
-        key = _fci_key(row.get("lenderAccount"))
-        if not key:
-            continue
-        rows_by_key.setdefault(key, []).append(row)
-
-    override_key = _fci_key(lender_account_override)
-    if override_key:
-        matches = rows_by_key.get(override_key) or []
-        if len(matches) == 1:
-            out["matched"] = True
-            out["record"] = matches[0]
-            out["match_source"] = "Manual FCI lender account override"
-            return out
-
-    for candidate in out["candidate_keys"]:
-        matches = rows_by_key.get(candidate["clean"]) or []
-        if len(matches) == 1:
-            out["matched"] = True
-            out["record"] = matches[0]
-            out["match_source"] = candidate["label"]
-            return out
-
-    if len(rows) == 1:
-        out["matched"] = True
-        out["record"] = rows[0]
-        out["match_source"] = "Single FCI row returned"
-        return out
-
-    if override_key:
-        out["error"] = "The FCI lender account override did not match a single FCI row."
-    else:
-        out["error"] = "Could not match an FCI lender account to this deal."
-    return out
-
-
-def _fci_late_payment_result(fci_record: dict) -> str | None:
-    if not fci_record:
-        return None
-
-    amount = _parse_float(fci_record.get("poffUnpaidLateCharges"))
-    days = _parse_float(fci_record.get("lateChargesDays"))
-    pct = _parse_float(fci_record.get("lateChargesPct"))
-
-    seen_any = any(v is not None for v in [amount, days, pct])
-    if not seen_any:
-        return None
-
-    if any((v or 0) > 0 for v in [amount, days, pct]):
-        return "Late payments found"
-    return "No issues"
 
 
 def _delinquency_found(servicer_row: dict) -> bool | None:
@@ -1607,116 +1423,6 @@ def _delinquency_found(servicer_row: dict) -> bool | None:
     return None
 
 
-def _raw_checklist_value(val) -> str:
-    s = normalize_text(val)
-    if not s:
-        return ""
-    if s.lower() in {"need review", "review"}:
-        return ""
-    return s
-
-
-def _normalize_checklist_value(val) -> str:
-    s = _raw_checklist_value(val)
-    return s or CHECKLIST_NOT_FOUND
-
-
-def _is_checklist_missing(val) -> bool:
-    return _normalize_checklist_value(val).lower() == CHECKLIST_NOT_FOUND.lower()
-
-
-def derive_expected_next_payment_due_from_close_date(close_date_value) -> str:
-    close_date = parse_date_any(close_date_value)
-    if not close_date:
-        return ""
-
-    cutoff = date(2025, 7, 1)
-    due_day = 1 if close_date > cutoff else 10
-
-    if close_date.month == 12:
-        due_year = close_date.year + 1
-        due_month = 1
-    else:
-        due_year = close_date.year
-        due_month = close_date.month + 1
-
-    try:
-        return date(due_year, due_month, due_day).strftime("%m/%d/%Y")
-    except Exception:
-        return ""
-
-
-def get_checklist_servicer_key(bundle: dict) -> str:
-    opp = bundle.get("opportunity") or {}
-    prop = bundle.get("primary_property") or {}
-    servicer_loans = bundle.get("servicer_loans") or []
-
-    servicer_commitment = ""
-    for row in servicer_loans:
-        servicer_commitment = normalize_text(row.get("Servicer_Commitment_ID__c"))
-        if servicer_commitment:
-            break
-
-    return pick_first(
-        prop.get("Servicer_Id__c"),
-        opp.get("Servicer_Commitment_Id__c"),
-        servicer_commitment,
-    )
-
-
-def interpret_tax_status_from_row(row: dict) -> str:
-    if not row:
-        return CHECKLIST_NOT_FOUND
-
-    cols = list(row.keys())
-    priority_cols = [c for c in cols if ("tax" in c.lower() or "delinq" in c.lower())]
-    status_cols = [c for c in cols if ("status" in c.lower() and c not in priority_cols)]
-
-    for col in priority_cols + status_cols:
-        raw = normalize_text(row.get(col))
-        low = raw.lower()
-        if not low:
-            continue
-        if "delinq" in col.lower():
-            if low in {"n", "no", "false"}:
-                return "Not delinquent"
-            if low in {"y", "yes", "true"}:
-                return "Delinquent"
-        if any(token in low for token in ["not delinquent", "current", "paid", "clear"]):
-            return "Not delinquent"
-        if any(token in low for token in ["delinq", "delinquent", "late", "past due", "unpaid"]):
-            return "Delinquent"
-
-    return CHECKLIST_NOT_FOUND
-
-
-def _sold_loan_or_cap_partner_value(bundle: dict) -> str:
-    opp = bundle.get("opportunity") or {}
-    prop = bundle.get("primary_property") or {}
-    sold_loan_pools = bundle.get("sold_loan_pools") or []
-    sold_to_account = bundle.get("sold_to_account") or {}
-    cap_partner_account = bundle.get("cap_partner_account") or {}
-
-    sold_name = normalize_text(sold_to_account.get("Name"))
-    cap_partner_name = normalize_text(cap_partner_account.get("Name"))
-    if sold_name or cap_partner_name:
-        return sold_name or cap_partner_name
-
-    current_balance = _first_nonblank_number(
-        prop.get("Current_Outstanding_Loan_Amount__c"),
-        prop.get("Current_UPB__c"),
-        opp.get("Current_UPB__c"),
-        opp.get("Current_Loan_Amount__c"),
-    )
-    if current_balance is not None and current_balance <= 0:
-        return "No loan balance"
-
-    if sold_loan_pools or opp.get("Intended_Capital_Partner__c") or prop.get("Sold_Loan_Pool__c"):
-        return "Sold loan / cap partner found"
-
-    return CHECKLIST_NOT_FOUND
-
-
 def derive_checklist_export_values(bundle: dict) -> Dict[str, str]:
     values = checklist_blank_export_values()
     if not bundle:
@@ -1724,145 +1430,137 @@ def derive_checklist_export_values(bundle: dict) -> Dict[str, str]:
 
     opp = bundle.get("opportunity") or {}
     prop = bundle.get("primary_property") or {}
+    account = bundle.get("account") or {}
+    cap_partner_account = bundle.get("cap_partner_account") or {}
     servicer_loans = bundle.get("servicer_loans") or []
-    fci = bundle.get("fci") or {}
-    fci_record = fci.get("record") or {}
+    sold_loan_pools = bundle.get("sold_loan_pools") or []
+    sold_to_account = bundle.get("sold_to_account") or {}
+    reo = bundle.get("reo") or {}
 
-    values["sold_loan_or_cap_partner"] = _sold_loan_or_cap_partner_value(bundle)
+    sold_name = normalize_text(sold_to_account.get("Name"))
+    cap_partner_name = normalize_text(cap_partner_account.get("Name"))
+    buyer_name = sold_name or cap_partner_name
+    has_sold_or_cap_partner = bool(buyer_name or sold_loan_pools or opp.get("Intended_Capital_Partner__c") or prop.get("Sold_Loan_Pool__c"))
+    values["sold_loan_status"] = "Cap partner / sold loan" if has_sold_or_cap_partner else "Not applicable"
+    values["loan_buyer_or_cap_partner"] = buyer_name
 
-    next_due = fmt_date_mmddyyyy(
+    values["next_payment_due"] = fmt_date_mmddyyyy(
         pick_first(
-            fci_record.get("nextDueDate"),
             prop.get("Next_Payment_Date__c"),
             opp.get("Next_Payment_Date__c"),
         )
-    ) or derive_expected_next_payment_due_from_close_date(opp.get("CloseDate"))
-    values["next_payment_due"] = _normalize_checklist_value(next_due)
+    )
 
-    late_value = CHECKLIST_NOT_FOUND
-    fci_late_result = _fci_late_payment_result(fci_record)
-    if fci_late_result == "No issues":
-        late_value = "No late payments found"
-    elif fci_late_result == "Late payments found":
-        late_value = "Late payments found"
-    else:
-        delinquency_result = None
-        for servicer_row in servicer_loans:
-            delinquency_result = _delinquency_found(servicer_row)
-            if delinquency_result is True:
-                break
-            if delinquency_result is False:
-                break
+    delinquency_result = None
+    for servicer_row in servicer_loans:
+        delinquency_result = _delinquency_found(servicer_row)
         if delinquency_result is True:
-            late_value = "Late payments found"
-        elif delinquency_result is False:
-            late_value = "No late payments found"
-    values["late_payment_check"] = _normalize_checklist_value(late_value)
+            break
+        if delinquency_result is False:
+            break
+    if delinquency_result is True:
+        values["late_payment_check"] = "Late payments found"
+    elif delinquency_result is False:
+        values["late_payment_check"] = "No issues"
 
-    maturity_date = fmt_date_mmddyyyy(
+    values["maturity_date"] = fmt_date_mmddyyyy(
         pick_first(
-            fci_record.get("maturityDate"),
             prop.get("Updated_Asset_Maturity_Date__c"),
             opp.get("Updated_Loan_Maturity_Date__c"),
         )
     )
-    values["maturity_date"] = _normalize_checklist_value(maturity_date)
 
-    servicer_key = get_checklist_servicer_key(bundle)
-    osc = osc_lookup(servicer_key)
-    osc_addr = ""
-    insurance_value = CHECKLIST_NOT_FOUND
-    if osc.get("found"):
-        row = osc.get("row") or {}
-        osc_primary = normalize_text(row.get("primary_status"))
-        osc_addr = " ".join([
-            normalize_text(row.get("property_street")),
-            normalize_text(row.get("property_city")),
-            normalize_text(row.get("property_state")),
-            normalize_text(row.get("property_zip")),
-        ]).strip()
-        if osc_primary.strip().lower() == TARGET_INSURANCE_OK:
-            insurance_value = "Current"
-        elif osc_primary:
-            insurance_value = "Not current"
-    values["insurance_status"] = _normalize_checklist_value(insurance_value)
+    taxes_status = normalize_text(reo.get("Taxes_Status__c")).lower()
+    if taxes_status:
+        if "delinq" in taxes_status or "late" in taxes_status:
+            values["tax_status"] = "Delinquent"
+        else:
+            values["tax_status"] = "Current / good"
+    elif normalize_text(prop.get("Tax_Payment_Next_Due_Date__c")):
+        values["tax_status"] = "Current / good"
 
-    caf = caf_try_match_by_deal_id(normalize_text(opp.get("Deal_Loan_Number__c")))
-    if not caf.get("found"):
-        caf = caf_try_match_by_address(normalize_text(prop.get("Full_Address__c")), osc_addr)
-    tax_value = interpret_tax_status_from_row((caf.get("row") or {})) if caf.get("found") else CHECKLIST_NOT_FOUND
-    values["tax_status"] = _normalize_checklist_value(tax_value)
+    values["supplier_code"] = normalize_text(account.get("Yardi_Vendor_Code__c"))
 
-    supplier_code = pick_first(
-        prop.get("Warehouse_Line_New__c"),
-        prop.get("Warehouse_Line__c"),
-        opp.get("Warehouse_Line__c"),
+    insurance_status = normalize_text(prop.get("Insurance_Status__c"))
+    insurance_status_lower = insurance_status.lower()
+    insurance_exp = parse_date_any(prop.get("Insurance_Expiration_Date__c"))
+    today = date.today()
+    if insurance_status_lower:
+        if any(token in insurance_status_lower for token in ["current", "in-force", "in force", "active"]):
+            values["insurance_status"] = "Current"
+        elif any(token in insurance_status_lower for token in ["expired", "cancel", "cancelled", "canceled", "lapse", "missing"]):
+            values["insurance_status"] = "Expired / missing"
+    elif insurance_exp:
+        values["insurance_status"] = "Current" if insurance_exp >= today else "Expired / missing"
+
+    remaining_commitment = _first_nonblank_number(prop.get("Outstanding_Facility_Amount__c"))
+    current_balance = _first_nonblank_number(
+        prop.get("Current_Outstanding_Loan_Amount__c"),
+        prop.get("Current_UPB__c"),
     )
-    values["supplier_code"] = _normalize_checklist_value(supplier_code)
+    current_value = _first_nonblank_number(
+        prop.get("Updated_Value__c"),
+        prop.get("Value__c"),
+    )
+    if remaining_commitment is not None:
+        values["remaining_value_status"] = "Enough remaining value" if remaining_commitment > 0 else "Low / insufficient"
+    elif current_value is not None and current_balance is not None:
+        values["remaining_value_status"] = "Enough remaining value" if current_value > current_balance else "Low / insufficient"
 
-    return {key: _normalize_checklist_value(val) for key, val in values.items()}
+    return values
 
 
 def build_checklist_auto_answers(form_values: dict) -> Dict[int, dict]:
     answers: Dict[int, dict] = {}
 
-    sold_value = _normalize_checklist_value(form_values.get("sold_loan_or_cap_partner"))
-    answers[2] = {
-        "status": "Complete" if not _is_checklist_missing(sold_value) else "Review",
-        "value": sold_value,
-        "source": "",
-    }
+    sold_status = normalize_text(form_values.get("sold_loan_status"))
+    loan_buyer = normalize_text(form_values.get("loan_buyer_or_cap_partner"))
+    if sold_status == "Not applicable":
+        answers[2] = {"status": "Not Applicable", "value": "", "source": "Salesforce"}
+    elif sold_status == "Cap partner / sold loan":
+        answers[2] = {
+            "status": "Complete" if loan_buyer else "Review",
+            "value": loan_buyer,
+            "source": "Salesforce" if loan_buyer else "Manual review needed",
+        }
+    else:
+        answers[2] = {"status": "Review", "value": loan_buyer, "source": "Manual review needed"}
 
-    next_due = _normalize_checklist_value(form_values.get("next_payment_due"))
     answers[3] = {
-        "status": "Complete" if not _is_checklist_missing(next_due) else "Review",
-        "value": next_due,
-        "source": "",
+        "status": "Complete" if normalize_text(form_values.get("next_payment_due")) else "Review",
+        "value": normalize_text(form_values.get("next_payment_due")),
+        "source": "Salesforce",
     }
 
-    late_value = _normalize_checklist_value(form_values.get("late_payment_check"))
-    late_lower = late_value.lower()
-    if late_lower == "no late payments found":
-        late_status = "Complete"
-    elif late_lower == "late payments found":
-        late_status = "Review"
-    else:
-        late_status = "Review"
-    answers[4] = {"status": late_status, "value": late_value, "source": ""}
+    status, value, source = checklist_answer_from_choice(normalize_text(form_values.get("late_payment_check")), "Servicer_Loan__c")
+    answers[4] = {"status": status, "value": value, "source": source}
 
-    maturity_value = _normalize_checklist_value(form_values.get("maturity_date"))
     answers[5] = {
-        "status": "Complete" if not _is_checklist_missing(maturity_value) else "Review",
-        "value": maturity_value,
-        "source": "",
+        "status": "Complete" if normalize_text(form_values.get("maturity_date")) else "Review",
+        "value": normalize_text(form_values.get("maturity_date")),
+        "source": "Salesforce",
     }
 
-    tax_value = _normalize_checklist_value(form_values.get("tax_status"))
-    tax_lower = tax_value.lower()
-    if tax_lower == "not delinquent":
-        tax_status = "Complete"
-    elif tax_lower == "delinquent":
-        tax_status = "Review"
-    else:
-        tax_status = "Review"
-    answers[6] = {"status": tax_status, "value": tax_value, "source": ""}
+    status, value, source = checklist_answer_from_choice(normalize_text(form_values.get("tax_status")), "REO__c / Property__c")
+    answers[6] = {"status": status, "value": value, "source": source}
 
-    supplier_code = _normalize_checklist_value(form_values.get("supplier_code"))
+    supplier_code = normalize_text(form_values.get("supplier_code"))
     answers[7] = {
-        "status": "Complete" if not _is_checklist_missing(supplier_code) else "Review",
+        "status": "Complete" if supplier_code else "Review",
         "value": supplier_code,
-        "source": "",
+        "source": "Account" if supplier_code else "Manual review needed",
     }
 
-    insurance_value = _normalize_checklist_value(form_values.get("insurance_status"))
-    insurance_lower = insurance_value.lower()
-    if insurance_lower == "current":
-        insurance_status = "Complete"
-    elif insurance_lower == "not current":
-        insurance_status = "Review"
-    else:
-        insurance_status = "Review"
-    answers[8] = {"status": insurance_status, "value": insurance_value, "source": ""}
+    status, value, source = checklist_answer_from_choice(normalize_text(form_values.get("insurance_status")), "Property__c")
+    answers[8] = {"status": status, "value": value, "source": source}
+
+    status, value, source = checklist_answer_from_choice(
+        normalize_text(form_values.get("remaining_value_status")),
+        "Property__c",
+        good_label="Complete",
+        bad_label="Review",
+    )
+    answers[32] = {"status": status, "value": value, "source": source}
 
     return answers
 
@@ -1885,20 +1583,30 @@ def build_checklist_output_workbook(template_bytes: bytes, edited_rows: pd.DataF
     ws = wb[wb.sheetnames[0]]
 
     ws["C1"] = "Status"
-    ws["D1"] = "Value"
+    ws["D1"] = "Value / Date"
+    ws["E1"] = "Source / Notes"
 
     header_font = Font(bold=True, color="FF000000")
-    for cell_ref in ["C1", "D1"]:
+    for cell_ref in ["C1", "D1", "E1"]:
         ws[cell_ref].font = header_font
 
     ws.column_dimensions["C"].width = 16
-    ws.column_dimensions["D"].width = 34
+    ws.column_dimensions["D"].width = 24
+    ws.column_dimensions["E"].width = 42
 
     for _, row in edited_rows.iterrows():
         r = int(row["row_number"])
         ws[f"C{r}"] = row["status"]
         ws[f"D{r}"] = row["value"]
-        for cell_ref in [f"C{r}", f"D{r}"]:
+
+        note_parts = []
+        if str(row.get("source", "")).strip():
+            note_parts.append(str(row["source"]).strip())
+        if str(row.get("notes", "")).strip():
+            note_parts.append(str(row["notes"]).strip())
+        ws[f"E{r}"] = " | ".join(note_parts)
+
+        for cell_ref in [f"C{r}", f"D{r}", f"E{r}"]:
             ws[cell_ref].font = Font(color="FF000000")
 
     out = io.BytesIO()
@@ -1909,15 +1617,16 @@ def build_checklist_output_workbook(template_bytes: bytes, edited_rows: pd.DataF
 def build_checklist_export_rows(export_values: dict) -> pd.DataFrame:
     rows = []
     for spec in CHECKLIST_EXPORT_SPECS:
-        value = _normalize_checklist_value(export_values.get(spec["field"]))
+        val = normalize_text(export_values.get(spec["field"]))
         rows.append(
             {
                 "order": spec["order"],
                 "checklist_row": spec["row_number"],
-                "field": spec["field"],
+                "export_field": spec["field"],
                 "checklist_item": spec["label"],
-                "value": value,
-                "found": "Yes" if not _is_checklist_missing(value) else "No",
+                "value": val,
+                "source_hint": spec["source_hint"],
+                "ready": "Yes" if val else "Review",
             }
         )
     return pd.DataFrame(rows)
@@ -1926,18 +1635,36 @@ def build_checklist_export_rows(export_values: dict) -> pd.DataFrame:
 def build_checklist_export_excel_bytes(export_df: pd.DataFrame, deal_number: str) -> bytes:
     wb = Workbook()
     ws = wb.active
-    ws.title = "Checklist Values"
+    ws.title = "Red Fields Export"
 
-    headers = ["Deal Number", "Checklist Item", "Value"]
+    headers = ["Deal Number", "Checklist Row", "Export Field", "Checklist Item", "Value", "Source Hint", "Ready"]
     ws.append(headers)
 
     for cell in ws[1]:
         cell.font = Font(bold=True, color="FF000000")
 
     for _, row in export_df.iterrows():
-        ws.append([deal_number, row["checklist_item"], row["value"]])
+        ws.append(
+            [
+                deal_number,
+                row["checklist_row"],
+                row["export_field"],
+                row["checklist_item"],
+                row["value"],
+                row["source_hint"],
+                row["ready"],
+            ]
+        )
 
-    widths = {"A": 16, "B": 42, "C": 28}
+    widths = {
+        "A": 16,
+        "B": 14,
+        "C": 28,
+        "D": 34,
+        "E": 28,
+        "F": 56,
+        "G": 12,
+    }
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
 
@@ -1947,60 +1674,49 @@ def build_checklist_export_excel_bytes(export_df: pd.DataFrame, deal_number: str
 
 
 def render_checklist_export_summary(export_df: pd.DataFrame):
-    found = int((export_df["found"] == "Yes").sum())
-    missing = int((export_df["found"] == "No").sum())
+    filled = int((export_df["ready"] == "Yes").sum())
+    review = int((export_df["ready"] == "Review").sum())
     c1, c2 = st.columns(2)
-    c1.metric("Values found", found)
-    c2.metric("Still missing", missing)
-
-
-
-def _export_df_to_values(export_df: pd.DataFrame) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for _, row in export_df.iterrows():
-        out[str(row["field"])] = _normalize_checklist_value(row["value"])
-    return out
+    c1.metric("Red export fields ready", filled)
+    c2.metric("Need review", review)
 
 
 def run_construction_checklist_page():
     ensure_default("checklist_deal_number_input", "")
-    ensure_default("checklist_fci_lender_account_override", "")
     ensure_default("checklist_bundle", None)
     ensure_default("checklist_export_values", checklist_blank_export_values())
 
     st.subheader("Construction Checklist")
-    st.caption("Enter a deal number to pull the checklist values, review them, and export the completed checklist.")
+    st.caption(
+        "Pull the top red-font checklist fields from Salesforce, review them, then export a red-field list or a completed checklist workbook."
+    )
 
-    with st.expander("Admin options", expanded=False):
-        uploaded_template = st.file_uploader(
-            "Checklist template (optional if already in the repo folder)",
-            type=["xlsx"],
-            key="construction_template_upload",
-        )
-        lender_account_override = st.text_input(
-            "FCI lender account override (optional)",
-            key="checklist_fci_lender_account_override",
-            placeholder="Use only if the automatic FCI match misses",
-        )
+    uploaded_template = st.file_uploader(
+        "Upload the construction checklist template (optional if the file is already in the repo folder)",
+        type=["xlsx"],
+        key="construction_template_upload",
+    )
 
     template_bytes, template_name = pick_checklist_template_bytes(uploaded_template)
+    if template_bytes is None:
+        st.warning("Add the checklist Excel file next to this app or upload it above to enable workbook export.")
 
     st.markdown('<div class="soft-card">', unsafe_allow_html=True)
-    c1, c2 = st.columns([2.2, 1.0])
+    c1, c2 = st.columns([2.4, 1.2])
     with c1:
         deal_input = st.text_input(
             "Deal Number",
             key="checklist_deal_number_input",
-            placeholder="Type the deal number",
+            placeholder="Type the deal number for the construction checklist",
         )
     with c2:
-        pull_btn = st.button("Get checklist values", type="primary", use_container_width=True)
+        pull_btn = st.button("Pull red checklist fields", type="primary", use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
     if pull_btn:
         st.session_state.checklist_bundle = None
         st.session_state.checklist_export_values = checklist_blank_export_values()
-        bundle = fetch_construction_checklist_bundle(deal_input, lender_account_override)
+        bundle = fetch_construction_checklist_bundle(deal_input)
         if not bundle:
             st.error("No deal found for that number. Double-check the deal number and try again.")
         else:
@@ -2018,11 +1734,12 @@ def run_construction_checklist_page():
         st.markdown(
             f"""
 <div class="soft-card">
-  <div class="big"><b>{normalize_text(opp.get('Deal_Loan_Number__c')) or normalize_text(opp.get('Name'))}</b></div>
-  <div class="muted">Borrower: {normalize_text(account.get('Name')) or '—'}</div>
+  <div class="big"><b>{normalize_text(opp.get('Deal_Loan_Number__c')) or normalize_text(opp.get('Name'))}</b> — {normalize_text(opp.get('Name')) or 'Deal'}</div>
+  <div class="muted">Borrower account: {normalize_text(account.get('Name')) or '—'}</div>
   <div style="margin-top:8px;">
     <span class="pill">Property: <b>{normalize_text(prop.get('Property_Name__c') or prop.get('Name')) or '—'}</b></span>
     <span class="pill">Address: <b>{normalize_text(prop.get('Full_Address__c')) or '—'}</b></span>
+    <span class="pill">Properties found: <b>{len(bundle.get('properties') or [])}</b></span>
   </div>
 </div>
 """,
@@ -2030,53 +1747,91 @@ def run_construction_checklist_page():
         )
 
         export_df = build_checklist_export_rows(export_values)
-        st.markdown("### Checklist values")
+        st.markdown("### Red-field export list")
         render_checklist_export_summary(export_df)
-
-        editor_view = export_df[["checklist_item", "value"]].copy()
-        edited_view = st.data_editor(
-            editor_view,
+        st.dataframe(
+            export_df[["checklist_row", "export_field", "checklist_item", "value", "source_hint", "ready"]],
             use_container_width=True,
             hide_index=True,
-            num_rows="fixed",
-            key="construction_checklist_values_editor",
-            disabled=["checklist_item"],
-            column_config={
-                "checklist_item": st.column_config.TextColumn("Checklist item", width="large", disabled=True),
-                "value": st.column_config.TextColumn("Value", width="medium"),
-            },
         )
-        export_df["value"] = edited_view["value"].map(_normalize_checklist_value)
-        export_df["found"] = export_df["value"].map(lambda v: "No" if _is_checklist_missing(v) else "Yes")
 
         deal_number_for_file = normalize_text(opp.get("Deal_Loan_Number__c")) or normalize_text(st.session_state.get("checklist_deal_number_input")) or "deal"
-        export_csv = export_df[["checklist_item", "value"]].to_csv(index=False).encode("utf-8")
+        export_csv = export_df.drop(columns=["order"]).to_csv(index=False).encode("utf-8")
         export_xlsx = build_checklist_export_excel_bytes(export_df, deal_number_for_file)
 
         d1, d2 = st.columns(2)
         with d1:
             st.download_button(
-                "Download checklist values (CSV)",
+                "Download red-field export (CSV)",
                 data=export_csv,
-                file_name=f"construction_checklist_values_{re.sub(r'[^0-9A-Za-z_-]+', '_', deal_number_for_file)}.csv",
+                file_name=f"construction_red_field_export_{re.sub(r'[^0-9A-Za-z_-]+', '_', deal_number_for_file)}.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
         with d2:
             st.download_button(
-                "Download checklist values (Excel)",
+                "Download red-field export (Excel)",
                 data=export_xlsx,
-                file_name=f"construction_checklist_values_{re.sub(r'[^0-9A-Za-z_-]+', '_', deal_number_for_file)}.xlsx",
+                file_name=f"construction_red_field_export_{re.sub(r'[^0-9A-Za-z_-]+', '_', deal_number_for_file)}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
 
         if template_bytes is not None:
             base_df = extract_checklist_template_rows(template_bytes)
-            edited_values = _export_df_to_values(export_df)
-            filled_df = apply_checklist_auto_answers(base_df, build_checklist_auto_answers(edited_values))
-            download_rows = filled_df[filled_df["row_number"].isin([2, 3, 4, 5, 6, 7, 8])].copy()
-            output_bytes = build_checklist_output_workbook(template_bytes, download_rows)
+            red_count = int(base_df["is_red"].sum())
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Checklist items", int(len(base_df)))
+            c2.metric("Red-font items", red_count)
+            c3.metric("Template", template_name)
+
+            working_df = apply_checklist_auto_answers(base_df, build_checklist_auto_answers(export_values))
+            show_only_red = st.toggle("Show only red-font checklist rows first", value=True, key="construction_show_only_red")
+
+            editor_df = working_df.copy()
+            if show_only_red:
+                editor_df = editor_df[editor_df["is_red"]].copy()
+
+            editor_df = editor_df[
+                ["row_number", "section", "item", "helper", "status", "value", "source", "notes"]
+            ].reset_index(drop=True)
+
+            st.markdown("### Checklist review")
+            edited_df = st.data_editor(
+                editor_df,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                disabled=["row_number", "section", "item", "helper"],
+                key="construction_checklist_editor",
+                column_config={
+                    "row_number": st.column_config.NumberColumn("Row", disabled=True),
+                    "section": st.column_config.TextColumn("Section", disabled=True),
+                    "item": st.column_config.TextColumn("Checklist item", width="large", disabled=True),
+                    "helper": st.column_config.TextColumn("Template helper text", width="large", disabled=True),
+                    "status": st.column_config.SelectboxColumn("Status", options=CHECKLIST_STATUS_OPTIONS, required=True),
+                    "value": st.column_config.TextColumn("Value / Date", width="medium"),
+                    "source": st.column_config.TextColumn("Source", width="medium"),
+                    "notes": st.column_config.TextColumn("Notes", width="large"),
+                },
+            )
+
+            completed_count = int((edited_df["status"] == "Complete").sum())
+            review_count = int((edited_df["status"] == "Review").sum())
+            c1, c2 = st.columns(2)
+            c1.metric("Completed in current view", completed_count)
+            c2.metric("Needs review in current view", review_count)
+
+            if not show_only_red:
+                download_source_df = edited_df.copy()
+            else:
+                download_source_df = working_df.copy()
+                for _, row in edited_df.iterrows():
+                    mask = download_source_df["row_number"] == int(row["row_number"])
+                    for col in ["status", "value", "source", "notes"]:
+                        download_source_df.loc[mask, col] = row[col]
+
+            output_bytes = build_checklist_output_workbook(template_bytes, download_source_df)
             st.download_button(
                 "Download completed checklist workbook",
                 data=output_bytes,
@@ -2086,26 +1841,9 @@ def run_construction_checklist_page():
                 use_container_width=True,
             )
         else:
-            st.info("Add the checklist template to the repo folder or upload it in Admin options to enable workbook export.")
-
-        with st.expander("Admin / troubleshooting", expanded=False):
-            st.write("Checklist template:", template_name or "Not found")
-            st.write("OSC file:", Path(osc_path_used).name if normalize_text(osc_path_used) else "Not found")
-            st.write("CAF file:", Path(caf_path_used).name if normalize_text(caf_path_used) else "Not found")
-
-            fci = bundle.get("fci") or {}
-            if not fci.get("enabled"):
-                st.write("FCI:", "Not configured")
-            elif fci.get("record"):
-                record = fci.get("record") or {}
-                st.write("FCI match:", normalize_text(fci.get("match_source")) or "Matched")
-                st.write("FCI next due date:", fmt_date_mmddyyyy(record.get("nextDueDate")) or CHECKLIST_NOT_FOUND)
-                st.write("FCI maturity date:", fmt_date_mmddyyyy(record.get("maturityDate")) or CHECKLIST_NOT_FOUND)
-            else:
-                st.write("FCI:", normalize_text(fci.get("error")) or "No match found")
+            st.info("Upload the checklist template above if you also want the completed workbook export.")
     else:
-        st.info("Enter a deal number and get the checklist values to populate the list.")
-
+        st.info("Enter a deal number and pull the red checklist fields to populate the export list.")
 
 def ensure_default(key, val):
     if key not in st.session_state:
@@ -2411,6 +2149,876 @@ def run_hud_generator_page():
             )
 
 
+
+
+# -----------------------------
+# CONSTRUCTION CHECKLIST OVERRIDES
+# -----------------------------
+CHECKLIST_NOT_FOUND = "Not found"
+CHECKLIST_EXPORT_SPECS = [
+    {
+        "order": 1,
+        "field": "sold_loan_status",
+        "label": "NLB (No Loan Balance) or Cap Partner / Sold Loan",
+        "row_number": 2,
+    },
+    {
+        "order": 2,
+        "field": "next_payment_due",
+        "label": "Next payment due date",
+        "row_number": 3,
+    },
+    {
+        "order": 3,
+        "field": "late_payment_check",
+        "label": "Other payments late?",
+        "row_number": 4,
+    },
+    {
+        "order": 4,
+        "field": "maturity_date",
+        "label": "Maturity date",
+        "row_number": 5,
+    },
+    {
+        "order": 5,
+        "field": "tax_status",
+        "label": "Taxes not delinquent",
+        "row_number": 6,
+    },
+    {
+        "order": 6,
+        "field": "supplier_code",
+        "label": "Workday vendor set up / Supplier code",
+        "row_number": 7,
+    },
+    {
+        "order": 7,
+        "field": "insurance_status",
+        "label": "Property insurance current",
+        "row_number": 8,
+    },
+]
+
+FCI_BORROWER_PAYMENT_QUERY = """
+query GetBorrowerPayment {
+  getBorrowerPayment {
+    account
+    dateReceived
+    dateDue
+    dayVariance
+    paymentType
+    totalAmount
+    accruedLateCharges
+    lateChargesPaid
+    notes
+    uid
+  }
+}
+"""
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_fci_borrower_payment_rows(url: str, api_token: str) -> dict:
+    if not url or not api_token:
+        return {"ok": False, "rows": [], "error": "FCI API token is not configured."}
+
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {"query": FCI_BORROWER_PAYMENT_QUERY, "variables": {}}
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+    except Exception as exc:
+        return {"ok": False, "rows": [], "error": f"FCI borrower payment request failed: {exc}"}
+
+    if "errors" in result:
+        return {"ok": False, "rows": [], "error": json.dumps(result["errors"], indent=2)}
+
+    records = (result.get("data") or {}).get("getBorrowerPayment") or []
+    if isinstance(records, dict):
+        records = [records]
+    if not isinstance(records, list):
+        records = []
+
+    cleaned_rows = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        cleaned_rows.append(
+            {
+                "account": record.get("account"),
+                "dateReceived": record.get("dateReceived"),
+                "dateDue": record.get("dateDue"),
+                "dayVariance": record.get("dayVariance"),
+                "paymentType": record.get("paymentType"),
+                "totalAmount": record.get("totalAmount"),
+                "accruedLateCharges": record.get("accruedLateCharges"),
+                "lateChargesPaid": record.get("lateChargesPaid"),
+                "notes": record.get("notes"),
+                "uid": record.get("uid"),
+            }
+        )
+
+    return {"ok": True, "rows": cleaned_rows, "error": ""}
+
+
+def checklist_display_or_not_found(value) -> str:
+    text = normalize_text(value)
+    return text if text else CHECKLIST_NOT_FOUND
+
+
+def checklist_has_value(value) -> bool:
+    return checklist_display_or_not_found(value) != CHECKLIST_NOT_FOUND
+
+
+def checklist_yes_no(flag) -> str:
+    if flag is True:
+        return "Yes"
+    if flag is False:
+        return "No"
+    return CHECKLIST_NOT_FOUND
+
+
+def fetch_checklist_opportunity_by_deal_number(deal_number: str):
+    dn_digits = digits_only((deal_number or "").strip())
+    if not dn_digits:
+        return None
+
+    fields = [
+        "Id",
+        "Name",
+        "Deal_Loan_Number__c",
+        "AccountId",
+        "Borrower_Entity__c",
+        "Intended_Capital_Partner__c",
+        "Updated_Loan_Maturity_Date__c",
+        "Next_Payment_Date__c",
+        "CloseDate",
+        "Servicer_Commitment_Id__c",
+        "Warehouse_Line__c",
+    ]
+    where = (
+        "("
+        f"Deal_Loan_Number__c = {soql_quote(dn_digits)}"
+        f" OR Deal_Loan_Number__c LIKE {soql_quote('%' + dn_digits + '%')}"
+        ")"
+    )
+    rows, _used, _soql = try_query_drop_missing(sf, "Opportunity", fields, where, limit=10, order_by="CloseDate DESC")
+    if not rows:
+        return None
+    r = rows[0].copy()
+    r.pop("attributes", None)
+    return r
+
+
+def fetch_checklist_properties_for_deal(opp_id: str):
+    lk = choose_first_existing("Property__c", ["Deal__c", "Opportunity__c", "Deal_Id__c", "OpportunityId", "DealId"])
+    if not lk:
+        return []
+
+    fields = [
+        "Id",
+        "Name",
+        lk,
+        "Property_Name__c",
+        "Full_Address__c",
+        "Next_Payment_Date__c",
+        "Updated_Asset_Maturity_Date__c",
+        "Tax_Payment_Next_Due_Date__c",
+        "Insurance_Status__c",
+        "Insurance_Expiration_Date__c",
+        "Outstanding_Facility_Amount__c",
+        "Value__c",
+        "Updated_Value__c",
+        "Current_Outstanding_Loan_Amount__c",
+        "Current_UPB__c",
+        "REO__c",
+        "Sold_Loan_Pool__c",
+        "Servicer_Loan__c",
+        "Servicer_Id__c",
+        "ConstructionManagementLoanId__c",
+        "Warehouse_Line_New__c",
+        "Warehouse_Line__c",
+    ]
+    where = f"{lk} = {soql_quote(opp_id)}"
+    rows, _used, _soql = try_query_drop_missing(sf, "Property__c", fields, where, limit=25, order_by="CreatedDate DESC")
+    cleaned = []
+    for r in rows:
+        rr = r.copy()
+        rr.pop("attributes", None)
+        cleaned.append(rr)
+    return cleaned
+
+
+def _fci_key(value: str) -> str:
+    return re.sub(r"[^0-9A-Za-z]", "", normalize_text(value)).upper()
+
+
+def get_checklist_servicer_key(bundle: dict) -> str:
+    opp = bundle.get("opportunity") or {}
+    prop = bundle.get("primary_property") or {}
+    servicer_loans = bundle.get("servicer_loans") or []
+
+    servicer_commitment = ""
+    for row in servicer_loans:
+        servicer_commitment = normalize_text(row.get("Servicer_Commitment_ID__c"))
+        if servicer_commitment:
+            break
+
+    return pick_first(
+        prop.get("Servicer_Id__c"),
+        opp.get("Servicer_Commitment_Id__c"),
+        prop.get("ConstructionManagementLoanId__c"),
+        servicer_commitment,
+    )
+
+
+def build_fci_candidate_keys(bundle: dict) -> list[dict]:
+    opp = bundle.get("opportunity") or {}
+    prop = bundle.get("primary_property") or {}
+    servicer_loans = bundle.get("servicer_loans") or []
+    candidates = []
+
+    def add(raw_value, label: str):
+        raw_value = normalize_text(raw_value)
+        clean_value = _fci_key(raw_value)
+        if not clean_value:
+            return
+        if any(item["clean"] == clean_value for item in candidates):
+            return
+        candidates.append({"raw": raw_value, "clean": clean_value, "label": label})
+
+    add(prop.get("Servicer_Id__c"), "Property servicer ID")
+    add(opp.get("Servicer_Commitment_Id__c"), "Opportunity servicer commitment ID")
+    add(prop.get("ConstructionManagementLoanId__c"), "Construction management loan ID")
+    for idx, row in enumerate(servicer_loans, start=1):
+        add(row.get("Servicer_Commitment_ID__c"), f"Servicer loan ID {idx}")
+        add(row.get("Name"), f"Servicer loan name {idx}")
+
+    return candidates
+
+
+def _group_rows_by_key(rows: list[dict], field_name: str) -> dict[str, list[dict]]:
+    grouped = {}
+    for row in rows or []:
+        key = _fci_key(row.get(field_name))
+        if not key:
+            continue
+        grouped.setdefault(key, []).append(row)
+    return grouped
+
+
+def fetch_fci_bundle(bundle: dict, loan_account_override: str = "") -> dict:
+    cfg = get_fci_config()
+    out = {
+        "enabled": cfg.get("enabled", False),
+        "candidate_keys": build_fci_candidate_keys(bundle),
+        "matched": False,
+        "match_source": "",
+        "loan_account": "",
+        "loan_info_record": {},
+        "payment_rows": [],
+        "loan_info_rows_found": 0,
+        "payment_rows_found": 0,
+        "error": "",
+    }
+    if not out["enabled"]:
+        out["error"] = "FCI is not configured."
+        return out
+
+    loan_info_result = fetch_fci_loan_information_rows(cfg["url"], cfg["api_token"])
+    payment_result = fetch_fci_borrower_payment_rows(cfg["url"], cfg["api_token"])
+
+    loan_info_rows = loan_info_result.get("rows") or []
+    payment_rows = payment_result.get("rows") or []
+    out["loan_info_rows_found"] = len(loan_info_rows)
+    out["payment_rows_found"] = len(payment_rows)
+
+    loan_info_by_key = _group_rows_by_key(loan_info_rows, "lenderAccount")
+    payment_by_key = _group_rows_by_key(payment_rows, "account")
+
+    def assign_match(clean_key: str, label: str) -> bool:
+        if not clean_key:
+            return False
+        if clean_key not in loan_info_by_key and clean_key not in payment_by_key:
+            return False
+        out["matched"] = True
+        out["loan_account"] = clean_key
+        out["match_source"] = label
+        out["loan_info_record"] = (loan_info_by_key.get(clean_key) or [{}])[0]
+        out["payment_rows"] = payment_by_key.get(clean_key) or []
+        return True
+
+    override_key = _fci_key(loan_account_override)
+    if override_key and assign_match(override_key, "Manual FCI loan account override"):
+        return out
+
+    for candidate in out["candidate_keys"]:
+        if assign_match(candidate["clean"], candidate["label"]):
+            return out
+
+    if len(loan_info_by_key) == 1 and len(payment_by_key) == 1:
+        only_loan_key = next(iter(loan_info_by_key.keys()))
+        only_payment_key = next(iter(payment_by_key.keys()))
+        if only_loan_key == only_payment_key and assign_match(only_loan_key, "Single FCI loan account returned"):
+            return out
+
+    errors = []
+    if not loan_info_result.get("ok"):
+        errors.append(loan_info_result.get("error") or "Loan information query failed.")
+    if not payment_result.get("ok"):
+        errors.append(payment_result.get("error") or "Borrower payment query failed.")
+    if not errors:
+        if override_key:
+            errors.append("The FCI loan account override did not match a loan account.")
+        else:
+            errors.append("Could not match the Salesforce servicer ID to an FCI loan account.")
+    out["error"] = " | ".join(errors)
+    return out
+
+
+def _late_payment_from_fci_loan_info(record: dict) -> bool | None:
+    if not record:
+        return None
+    amount = _parse_float(record.get("poffUnpaidLateCharges"))
+    days = _parse_float(record.get("lateChargesDays"))
+    pct = _parse_float(record.get("lateChargesPct"))
+    seen_any = any(v is not None for v in [amount, days, pct])
+    if not seen_any:
+        return None
+    return any((v or 0) > 0 for v in [amount, days, pct])
+
+
+def _late_payment_from_borrower_payments(rows: list[dict]) -> bool | None:
+    if not rows:
+        return None
+
+    usable = []
+    for row in rows:
+        payment_type = normalize_text(row.get("paymentType")).lower()
+        if payment_type and payment_type not in {"regpmt", "regularpayment", "regular payment"}:
+            continue
+        notes = normalize_text(row.get("notes")).lower()
+        if "reversed by" in notes:
+            continue
+        usable.append(row)
+
+    if not usable:
+        return None
+
+    usable.sort(
+        key=lambda r: (
+            parse_date_any(r.get("dateReceived")) or date.min,
+            parse_date_any(r.get("dateDue")) or date.min,
+        ),
+        reverse=True,
+    )
+    latest = usable[0]
+    metrics = [
+        _parse_float(latest.get("dayVariance")),
+        _parse_float(latest.get("accruedLateCharges")),
+        _parse_float(latest.get("lateChargesPaid")),
+    ]
+    seen_any = any(v is not None for v in metrics)
+    if not seen_any:
+        return None
+    return any((v or 0) > 0 for v in metrics)
+
+
+def _infer_tax_status_from_caf_row(row: dict) -> str:
+    if not row:
+        return CHECKLIST_NOT_FOUND
+
+    preferred_cols = []
+    for col in row.keys():
+        lower = (col or "").lower()
+        if any(token in lower for token in ["tax", "delinq", "delinquent", "install", "payment_status", "status"]):
+            preferred_cols.append(col)
+
+    for col in preferred_cols:
+        raw = normalize_text(row.get(col))
+        low = raw.lower()
+        if not low:
+            continue
+        if any(token in low for token in ["not delinquent", "current", "paid", "clear", "good standing"]):
+            return "Yes"
+        if any(token in low for token in ["delinq", "delinquent", "late", "past due", "unpaid", "default"]):
+            return "No"
+        if "delinq" in (col or "").lower():
+            if low in {"n", "no", "false", "0"}:
+                return "Yes"
+            if low in {"y", "yes", "true", "1"}:
+                return "No"
+
+    statuses = pick_payment_statuses(row)
+    if statuses:
+        return "Yes" if all(is_payment_status_ok(v) for (_k, v) in statuses) else "No"
+
+    return CHECKLIST_NOT_FOUND
+
+
+def _lookup_checklist_tax(bundle: dict, osc_match: dict) -> dict:
+    opp = bundle.get("opportunity") or {}
+    prop = bundle.get("primary_property") or {}
+
+    deal_digits = digits_only(normalize_text(opp.get("Deal_Loan_Number__c")))
+    caf = caf_try_match_by_deal_id(deal_digits)
+    if not caf.get("found"):
+        osc_addr = ""
+        if osc_match.get("found"):
+            row = osc_match.get("row") or {}
+            osc_addr = " ".join([
+                normalize_text(row.get("property_street")),
+                normalize_text(row.get("property_city")),
+                normalize_text(row.get("property_state")),
+                normalize_text(row.get("property_zip")),
+            ]).strip()
+        caf = caf_try_match_by_address(normalize_text(prop.get("Full_Address__c")), osc_addr)
+
+    tax_value = _infer_tax_status_from_caf_row(caf.get("row")) if caf.get("found") else CHECKLIST_NOT_FOUND
+    return {
+        "found": bool(caf.get("found")),
+        "method": normalize_text(caf.get("method")),
+        "value": tax_value,
+        "error": normalize_text(caf.get("error")),
+        "row": caf.get("row") or {},
+    }
+
+
+def _lookup_checklist_insurance(bundle: dict) -> dict:
+    servicer_key = get_checklist_servicer_key(bundle)
+    osc = osc_lookup(servicer_key)
+    if not osc.get("found"):
+        return {
+            "servicer_key": servicer_key,
+            "found": False,
+            "value": CHECKLIST_NOT_FOUND,
+            "error": normalize_text(osc.get("error")),
+            "row": {},
+        }
+
+    row = osc.get("row") or {}
+    primary_status = normalize_text(row.get("primary_status")).strip().lower()
+    if not primary_status:
+        value = CHECKLIST_NOT_FOUND
+    else:
+        value = "Yes" if primary_status == TARGET_INSURANCE_OK else "No"
+
+    return {
+        "servicer_key": servicer_key,
+        "found": True,
+        "value": value,
+        "error": "",
+        "row": row,
+    }
+
+
+def derive_checklist_export_values(bundle: dict) -> Dict[str, str]:
+    values = {
+        "sold_loan_status": CHECKLIST_NOT_FOUND,
+        "next_payment_due": CHECKLIST_NOT_FOUND,
+        "late_payment_check": CHECKLIST_NOT_FOUND,
+        "maturity_date": CHECKLIST_NOT_FOUND,
+        "tax_status": CHECKLIST_NOT_FOUND,
+        "supplier_code": CHECKLIST_NOT_FOUND,
+        "insurance_status": CHECKLIST_NOT_FOUND,
+    }
+    if not bundle:
+        return values
+
+    opp = bundle.get("opportunity") or {}
+    prop = bundle.get("primary_property") or {}
+    sold_loan_pools = bundle.get("sold_loan_pools") or []
+    servicer_loans = bundle.get("servicer_loans") or []
+    fci = bundle.get("fci") or {}
+    loan_info_record = fci.get("loan_info_record") or {}
+
+    sold_flag = bool(
+        sold_loan_pools
+        or opp.get("Intended_Capital_Partner__c")
+        or prop.get("Sold_Loan_Pool__c")
+    )
+    values["sold_loan_status"] = checklist_yes_no(sold_flag)
+
+    next_due_value = fmt_date_mmddyyyy(
+        pick_first(
+            loan_info_record.get("nextDueDate"),
+            prop.get("Next_Payment_Date__c"),
+            opp.get("Next_Payment_Date__c"),
+            derive_expected_next_payment_due_from_close_date(opp.get("CloseDate")),
+        )
+    )
+    values["next_payment_due"] = checklist_display_or_not_found(next_due_value)
+
+    late_flag = _late_payment_from_borrower_payments(fci.get("payment_rows") or [])
+    if late_flag is None:
+        late_flag = _late_payment_from_fci_loan_info(loan_info_record)
+    if late_flag is None:
+        for servicer_row in servicer_loans:
+            late_flag = _delinquency_found(servicer_row)
+            if late_flag is not None:
+                break
+    values["late_payment_check"] = checklist_yes_no(late_flag)
+
+    maturity_value = fmt_date_mmddyyyy(
+        pick_first(
+            loan_info_record.get("maturityDate"),
+            prop.get("Updated_Asset_Maturity_Date__c"),
+            opp.get("Updated_Loan_Maturity_Date__c"),
+        )
+    )
+    values["maturity_date"] = checklist_display_or_not_found(maturity_value)
+
+    insurance_lookup = _lookup_checklist_insurance(bundle)
+    values["insurance_status"] = insurance_lookup.get("value") or CHECKLIST_NOT_FOUND
+
+    tax_lookup = _lookup_checklist_tax(bundle, insurance_lookup)
+    values["tax_status"] = tax_lookup.get("value") or CHECKLIST_NOT_FOUND
+
+    supplier_code = pick_first(
+        prop.get("Warehouse_Line_New__c"),
+        prop.get("Warehouse_Line__c"),
+        opp.get("Warehouse_Line__c"),
+    )
+    values["supplier_code"] = checklist_display_or_not_found(supplier_code)
+
+    bundle["_checklist_support"] = {
+        "servicer_key": insurance_lookup.get("servicer_key") or get_checklist_servicer_key(bundle),
+        "fci_match_source": normalize_text(fci.get("match_source")),
+        "fci_loan_account": normalize_text(fci.get("loan_account")),
+        "fci_payment_rows": len(fci.get("payment_rows") or []),
+        "fci_error": normalize_text(fci.get("error")),
+        "tax_found": bool(tax_lookup.get("found")),
+        "tax_method": normalize_text(tax_lookup.get("method")),
+        "tax_error": normalize_text(tax_lookup.get("error")),
+        "insurance_found": bool(insurance_lookup.get("found")),
+        "insurance_error": normalize_text(insurance_lookup.get("error")),
+    }
+    return values
+
+
+def build_checklist_auto_answers(form_values: dict) -> Dict[int, dict]:
+    answers: Dict[int, dict] = {}
+
+    def clean_value(field_name: str) -> str:
+        value = checklist_display_or_not_found(form_values.get(field_name))
+        return "" if value == CHECKLIST_NOT_FOUND else value
+
+    sold_value = checklist_display_or_not_found(form_values.get("sold_loan_status"))
+    answers[2] = {
+        "status": "Complete" if sold_value != CHECKLIST_NOT_FOUND else "Review",
+        "value": "" if sold_value == CHECKLIST_NOT_FOUND else sold_value,
+        "source": "",
+        "notes": "",
+    }
+
+    next_due_value = checklist_display_or_not_found(form_values.get("next_payment_due"))
+    answers[3] = {
+        "status": "Complete" if next_due_value != CHECKLIST_NOT_FOUND else "Review",
+        "value": clean_value("next_payment_due"),
+        "source": "",
+        "notes": "",
+    }
+
+    late_value = checklist_display_or_not_found(form_values.get("late_payment_check"))
+    answers[4] = {
+        "status": "Complete" if late_value == "No" else "Review",
+        "value": "" if late_value == CHECKLIST_NOT_FOUND else late_value,
+        "source": "",
+        "notes": "",
+    }
+
+    maturity_value = checklist_display_or_not_found(form_values.get("maturity_date"))
+    answers[5] = {
+        "status": "Complete" if maturity_value != CHECKLIST_NOT_FOUND else "Review",
+        "value": clean_value("maturity_date"),
+        "source": "",
+        "notes": "",
+    }
+
+    taxes_value = checklist_display_or_not_found(form_values.get("tax_status"))
+    answers[6] = {
+        "status": "Complete" if taxes_value == "Yes" else "Review",
+        "value": "" if taxes_value == CHECKLIST_NOT_FOUND else taxes_value,
+        "source": "",
+        "notes": "",
+    }
+
+    supplier_value = checklist_display_or_not_found(form_values.get("supplier_code"))
+    answers[7] = {
+        "status": "Complete" if supplier_value != CHECKLIST_NOT_FOUND else "Review",
+        "value": clean_value("supplier_code"),
+        "source": "",
+        "notes": "",
+    }
+
+    insurance_value = checklist_display_or_not_found(form_values.get("insurance_status"))
+    answers[8] = {
+        "status": "Complete" if insurance_value == "Yes" else "Review",
+        "value": "" if insurance_value == CHECKLIST_NOT_FOUND else insurance_value,
+        "source": "",
+        "notes": "",
+    }
+
+    return answers
+
+
+def build_checklist_output_workbook(template_bytes: bytes, edited_rows: pd.DataFrame) -> bytes:
+    wb = load_workbook(io.BytesIO(template_bytes))
+    ws = wb[wb.sheetnames[0]]
+
+    ws["C1"] = "Status"
+    ws["D1"] = "Value"
+
+    header_font = Font(bold=True, color="FF000000")
+    for cell_ref in ["C1", "D1"]:
+        ws[cell_ref].font = header_font
+
+    ws.column_dimensions["C"].width = 16
+    ws.column_dimensions["D"].width = 36
+
+    for _, row in edited_rows.iterrows():
+        r = int(row["row_number"])
+        ws[f"C{r}"] = row["status"]
+        ws[f"D{r}"] = row["value"]
+        for cell_ref in [f"C{r}", f"D{r}"]:
+            ws[cell_ref].font = Font(color="FF000000")
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def build_checklist_export_rows(export_values: dict) -> pd.DataFrame:
+    rows = []
+    for spec in CHECKLIST_EXPORT_SPECS:
+        value = checklist_display_or_not_found(export_values.get(spec["field"]))
+        rows.append(
+            {
+                "order": spec["order"],
+                "field": spec["field"],
+                "checklist_item": spec["label"],
+                "value": value,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_checklist_export_excel_bytes(export_df: pd.DataFrame, deal_number: str) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Checklist Values"
+    ws.append(["Deal Number", "Checklist Item", "Value"])
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FF000000")
+    for _, row in export_df.iterrows():
+        ws.append([deal_number, row["checklist_item"], row["value"]])
+    ws.column_dimensions["A"].width = 18
+    ws.column_dimensions["B"].width = 42
+    ws.column_dimensions["C"].width = 28
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def render_checklist_export_summary(export_df: pd.DataFrame):
+    found = int((export_df["value"] != CHECKLIST_NOT_FOUND).sum())
+    missing = int((export_df["value"] == CHECKLIST_NOT_FOUND).sum())
+    c1, c2 = st.columns(2)
+    c1.metric("Values found", found)
+    c2.metric("Not found", missing)
+
+
+def fetch_construction_checklist_bundle(deal_number: str, loan_account_override: str = ""):
+    opp = fetch_checklist_opportunity_by_deal_number(deal_number)
+    if not opp:
+        return None
+
+    opp_id = opp.get("Id")
+    account = fetch_account_by_id(opp.get("AccountId")) if opp.get("AccountId") else None
+    business_entity = fetch_business_entity_by_id(opp.get("Borrower_Entity__c")) if opp.get("Borrower_Entity__c") else None
+    cap_partner_account = fetch_account_by_id(opp.get("Intended_Capital_Partner__c")) if opp.get("Intended_Capital_Partner__c") else None
+    properties = fetch_checklist_properties_for_deal(opp_id)
+    primary_property = properties[0] if properties else None
+    servicer_loans = fetch_servicer_loans_for_deal(opp_id)
+    sold_loan_pools = fetch_sold_loan_pools_for_deal(opp_id)
+    sold_to_account = None
+    if sold_loan_pools and sold_loan_pools[0].get("Sold_To__c"):
+        sold_to_account = fetch_account_by_id(sold_loan_pools[0].get("Sold_To__c"))
+    reo = fetch_reo_for_property(primary_property.get("Id")) if primary_property and primary_property.get("Id") else None
+
+    bundle = {
+        "opportunity": opp,
+        "account": account,
+        "business_entity": business_entity,
+        "cap_partner_account": cap_partner_account,
+        "properties": properties,
+        "primary_property": primary_property,
+        "servicer_loans": servicer_loans,
+        "sold_loan_pools": sold_loan_pools,
+        "sold_to_account": sold_to_account,
+        "reo": reo,
+    }
+    bundle["fci"] = fetch_fci_bundle(bundle, loan_account_override)
+    return bundle
+
+
+def run_construction_checklist_page():
+    ensure_default("checklist_deal_number_input", "")
+    ensure_default("checklist_loan_account_override", "")
+    ensure_default("checklist_bundle", None)
+    ensure_default("checklist_export_values", {})
+
+    st.subheader("Construction Checklist")
+    st.caption("Enter a deal number to pull the checklist values. The screen only shows the information the user needs.")
+
+    with st.expander("Admin options", expanded=False):
+        uploaded_template = st.file_uploader(
+            "Upload the construction checklist workbook",
+            type=["xlsx"],
+            key="construction_template_upload",
+        )
+        st.text_input(
+            "FCI loan account override",
+            key="checklist_loan_account_override",
+            placeholder="Use only if the automatic FCI match misses",
+        )
+        st.write("OSC file:", osc_path_used, "✅" if osc_err is None else "❌")
+        st.write("CAF / tax file:", caf_path_used, "✅" if caf_err is None else "❌")
+
+    template_bytes, template_name = pick_checklist_template_bytes(st.session_state.get("construction_template_upload"))
+
+    c1, c2 = st.columns([2.5, 1.0])
+    with c1:
+        deal_input = st.text_input(
+            "Deal Number",
+            key="checklist_deal_number_input",
+            placeholder="Enter the deal number",
+        )
+    with c2:
+        pull_btn = st.button("Get checklist values", type="primary", use_container_width=True)
+
+    if pull_btn:
+        st.session_state.checklist_bundle = None
+        st.session_state.checklist_export_values = {}
+        bundle = fetch_construction_checklist_bundle(
+            deal_input,
+            st.session_state.get("checklist_loan_account_override", ""),
+        )
+        if not bundle:
+            st.error("No deal found for that number.")
+        else:
+            values = derive_checklist_export_values(bundle)
+            st.session_state.checklist_bundle = bundle
+            st.session_state.checklist_export_values = values
+
+    bundle = st.session_state.get("checklist_bundle")
+    export_values = st.session_state.get("checklist_export_values") or {}
+    if not bundle:
+        st.info("Enter a deal number and click Get checklist values.")
+        return
+
+    opp = bundle.get("opportunity") or {}
+    prop = bundle.get("primary_property") or {}
+    account = bundle.get("account") or {}
+
+    st.markdown(
+        f"""
+<div class="soft-card">
+  <div class="big"><b>{normalize_text(opp.get('Deal_Loan_Number__c')) or normalize_text(st.session_state.get('checklist_deal_number_input'))}</b></div>
+  <div class="muted">{normalize_text(opp.get('Name')) or 'Deal'} • {normalize_text(account.get('Name')) or 'Borrower not found'}</div>
+  <div class="muted">{normalize_text(prop.get('Property_Name__c') or prop.get('Name')) or 'Property not found'}</div>
+  <div class="muted">{normalize_text(prop.get('Full_Address__c')) or 'Address not found'}</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    export_df = build_checklist_export_rows(export_values)
+    st.markdown("### Checklist values")
+    render_checklist_export_summary(export_df)
+
+    editor_df = export_df[["checklist_item", "value"]].copy()
+    edited_df = st.data_editor(
+        editor_df,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        disabled=["checklist_item"],
+        key="construction_checklist_values_editor",
+        column_config={
+            "checklist_item": st.column_config.TextColumn("Checklist item", width="large", disabled=True),
+            "value": st.column_config.TextColumn("Value", width="medium"),
+        },
+    )
+
+    edited_export_df = export_df.copy()
+    edited_export_df["value"] = edited_df["value"].astype(str)
+
+    edited_values = {}
+    for spec in CHECKLIST_EXPORT_SPECS:
+        mask = edited_export_df["field"] == spec["field"]
+        value = CHECKLIST_NOT_FOUND
+        if mask.any():
+            value = checklist_display_or_not_found(edited_export_df.loc[mask, "value"].iloc[0])
+        edited_values[spec["field"]] = value
+
+    deal_number_for_file = normalize_text(opp.get("Deal_Loan_Number__c")) or normalize_text(st.session_state.get("checklist_deal_number_input")) or "deal"
+    export_csv = edited_export_df[["checklist_item", "value"]].to_csv(index=False).encode("utf-8")
+    export_xlsx = build_checklist_export_excel_bytes(edited_export_df[["checklist_item", "value"]], deal_number_for_file)
+
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button(
+            "Download checklist values (CSV)",
+            data=export_csv,
+            file_name=f"construction_checklist_values_{re.sub(r'[^0-9A-Za-z_-]+', '_', deal_number_for_file)}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with d2:
+        st.download_button(
+            "Download checklist values (Excel)",
+            data=export_xlsx,
+            file_name=f"construction_checklist_values_{re.sub(r'[^0-9A-Za-z_-]+', '_', deal_number_for_file)}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+    if template_bytes is not None:
+        base_df = extract_checklist_template_rows(template_bytes)
+        working_df = apply_checklist_auto_answers(base_df, build_checklist_auto_answers(edited_values))
+        output_bytes = build_checklist_output_workbook(template_bytes, working_df)
+        st.download_button(
+            "Download completed checklist workbook",
+            data=output_bytes,
+            file_name=f"construction_checklist_completed_{re.sub(r'[^0-9A-Za-z_-]+', '_', deal_number_for_file)}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True,
+        )
+        st.caption(f"Workbook template: {template_name}")
+    else:
+        st.info("Upload the checklist workbook in Admin options if you want the completed workbook export.")
+
+    support = bundle.get("_checklist_support") or {}
+    with st.expander("Troubleshooting details", expanded=False):
+        st.write("FCI match source:", support.get("fci_match_source") or "Not found")
+        st.write("FCI loan account:", support.get("fci_loan_account") or "Not found")
+        st.write("FCI payment rows:", support.get("fci_payment_rows", 0))
+        if support.get("fci_error"):
+            st.write("FCI note:", support.get("fci_error"))
+        st.write("Servicer ID used:", support.get("servicer_key") or "Not found")
+        st.write("Tax match method:", support.get("tax_method") or "Not found")
+        if support.get("tax_error"):
+            st.write("Tax note:", support.get("tax_error"))
+        if support.get("insurance_error"):
+            st.write("Insurance note:", support.get("insurance_error"))
 
 def run_app():
     workflow = st.sidebar.radio(
