@@ -375,14 +375,94 @@ with topc2:
         st.rerun()
 
 # -----------------------------
+# OPTIONAL FCI CONFIG
+# -----------------------------
+FCI_DEFAULT_URL = "https://fapi.myfci.com/graphql"
+FCI_LOAN_INFORMATION_QUERY = """
+query GetLoanInformation {
+  getLoanInformation {
+    loanAccount: lenderAccount
+    poffUnpaidLateCharges
+    lateChargesDays
+    lateChargesPct
+    maturityDate
+    nextDueDate
+    noteRate
+  }
+}
+"""
+
+
+def get_fci_config() -> dict:
+    try:
+        cfg = st.secrets.get("fci", {})
+    except Exception:
+        cfg = {}
+    url = normalize_text(cfg.get("url")) if hasattr(cfg, "get") else ""
+    token = normalize_text(cfg.get("api_token")) if hasattr(cfg, "get") else ""
+    return {
+        "enabled": bool(token),
+        "url": url or FCI_DEFAULT_URL,
+        "api_token": token,
+    }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_fci_loan_information_rows(url: str, api_token: str) -> dict:
+    if not url or not api_token:
+        return {"ok": False, "rows": [], "error": "FCI API token is not configured."}
+
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {"query": FCI_LOAN_INFORMATION_QUERY, "variables": {}}
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+    except Exception as exc:
+        return {"ok": False, "rows": [], "error": f"FCI loan information request failed: {exc}"}
+
+    if "errors" in result:
+        return {"ok": False, "rows": [], "error": json.dumps(result["errors"], indent=2)}
+
+    records = (result.get("data") or {}).get("getLoanInformation") or []
+    if isinstance(records, dict):
+        records = [records]
+    if not isinstance(records, list):
+        records = []
+
+    cleaned_rows = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        cleaned_rows.append(
+            {
+                "loanAccount": record.get("loanAccount"),
+                "lenderAccount": record.get("loanAccount"),
+                "poffUnpaidLateCharges": record.get("poffUnpaidLateCharges"),
+                "lateChargesDays": record.get("lateChargesDays"),
+                "lateChargesPct": record.get("lateChargesPct"),
+                "maturityDate": record.get("maturityDate"),
+                "nextDueDate": record.get("nextDueDate"),
+                "noteRate": record.get("noteRate"),
+            }
+        )
+
+    return {"ok": True, "rows": cleaned_rows, "error": ""}
+
+
+# -----------------------------
 # LOAD EXCEL CHECK FILES
 # -----------------------------
 OSC_CANDIDATES = [
-    "OSC_Zstatus_COREVEST_2026-03-24_064223.xlsx",
+    "OSC_Zstatus_COREVEST_2026-04-14_202850.xlsx",
     "OSC_Zstatus_COREVEST_2026-03-24_064223.xlsx",
 ]
 CAF_CANDIDATES = [
-    "Corevest_CAF National 52874_3.9.26.xlsx",
+    "TAXES_CAF National 52874_3.9.26.xlsx",
     "Corevest_CAF National 52874_3.9.26.xlsx",
 ]
 
@@ -2203,7 +2283,7 @@ CHECKLIST_EXPORT_SPECS = [
 FCI_BORROWER_PAYMENT_QUERY = """
 query GetBorrowerPayment {
   getBorrowerPayment {
-    account
+    loanAccount: account
     dateReceived
     dateDue
     dayVariance
@@ -2251,7 +2331,8 @@ def fetch_fci_borrower_payment_rows(url: str, api_token: str) -> dict:
             continue
         cleaned_rows.append(
             {
-                "account": record.get("account"),
+                "loanAccount": record.get("loanAccount"),
+                "account": record.get("loanAccount"),
                 "dateReceived": record.get("dateReceived"),
                 "dateDue": record.get("dateDue"),
                 "dayVariance": record.get("dayVariance"),
@@ -2439,8 +2520,8 @@ def fetch_fci_bundle(bundle: dict, loan_account_override: str = "") -> dict:
     out["loan_info_rows_found"] = len(loan_info_rows)
     out["payment_rows_found"] = len(payment_rows)
 
-    loan_info_by_key = _group_rows_by_key(loan_info_rows, "lenderAccount")
-    payment_by_key = _group_rows_by_key(payment_rows, "account")
+    loan_info_by_key = _group_rows_by_key(loan_info_rows, "loanAccount")
+    payment_by_key = _group_rows_by_key(payment_rows, "loanAccount")
 
     def assign_match(clean_key: str, label: str) -> bool:
         if not clean_key:
@@ -2889,7 +2970,7 @@ def run_construction_checklist_page():
             placeholder="Use only if the automatic FCI match misses",
         )
         st.write("OSC file:", osc_path_used, "✅" if osc_err is None else "❌")
-        st.write("CAF / tax file:", caf_path_used, "✅" if caf_err is None else "❌")
+        st.write("CAF tax file:", caf_path_used, "✅" if caf_err is None else "❌")
 
     template_bytes, template_name = pick_checklist_template_bytes(st.session_state.get("construction_template_upload"))
 
