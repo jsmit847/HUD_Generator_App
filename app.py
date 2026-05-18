@@ -379,8 +379,8 @@ with topc2:
 # LOAD EXCEL CHECK FILES
 # -----------------------------
 OSC_CANDIDATES = [
-    "OSC_Zstatus_COREVEST_2026-04-14_202850.xlsx",
-    "OSC_Zstatus_COREVEST_2026-03-24_064223.xlsx",
+    "OSC_Zstatus_COREVEST_2026-05-13_104444.xlsx,",
+    "OSC_Zstatus_COREVEST_2026-05-13_104444.xlsx,",
 ]
 CAF_CANDIDATES = [
     "TAXES_CAF National 52874_3.9.26.xlsx",
